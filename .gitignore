@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────
+# Secrets — NEVER commit your API key
+# ─────────────────────────────────────────────────────────────
+FDA_MAUDE_API_KEY.txt
+api_key.txt
+*.key
+.env
+
+# ─────────────────────────────────────────────────────────────
+# Generated data & outputs (recreated by the collector/dashboard)
+# ─────────────────────────────────────────────────────────────
+fda_maude_cgm.db
+*.db
+*.sqlite
+*.sqlite3
+fda_maude_cgm.xlsx
+maude_full_dashboard_*.xlsx
+maude_insight_report_*.xlsx
+*.log
+
+# Personal / local analysis files (not part of the tool)
+Dexcom_libre_*.xlsx
+
+# Temporary working dirs
+tmp_maude_xlsx_unzip/
+tmp/
+temp/
+
+# ─────────────────────────────────────────────────────────────
+# Backup / old script versions (kept locally, not published)
+# ─────────────────────────────────────────────────────────────
+*복사본*.py
+raw_maude_dashboard.py
+
+# ─────────────────────────────────────────────────────────────
+# Python
+# ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.Python
+build/
+dist/
+*.egg-info/
+
+# ─────────────────────────────────────────────────────────────
+# Editors / OS
+# ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.gemini/
+*.swp
+.DS_Store
+Thumbs.db

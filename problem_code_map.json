@@ -1,0 +1,41 @@
+{
+  "common": {},
+  "patient": {
+    "Appropriate Clinical Signs, Symptoms, Conditions Term / Code Not Available": "4581",
+    "Insufficient Information": "4580",
+    "No Clinical Signs, Symptoms or Conditions": "4582",
+    "No Clinical Signs": "4582",
+    "Symptoms or Conditions": "4582",
+    "Hypoglycemia": "1912",
+    "Hyperglycemia": "1905",
+    "Loss of consciousness": "2418",
+    "Convulsion/Seizure": "4406",
+    "Dizziness": "2194",
+    "Fatigue": "1849",
+    "Vomiting": "2144",
+    "Cardiac Arrest": "1762",
+    "Coma": "2417",
+    "Hypoglycemic Shock": "4575",
+    "Diabetic Ketoacidosis": "2364",
+    "Elevated ketones/Diabetic Ketoacidosis": "2364",
+    "Diaphoresis": "2452",
+    "Shaking/Tremors": "2515",
+    "Skin Infection": "4544",
+    "Skin Inflammation/ Irritation": "4545"
+  },
+  "device": {
+    "Appropriate Term/Code Not Available": "3191",
+    "Appropriate Device Problem Term/Code Not Available": "3191",
+    "Insufficient Information": "3190",
+    "Insufficient Device Problem Information": "3190",
+    "Incorrect, Inadequate or Imprecise Result or Readings": "1535",
+    "Device Alarm System": "1012",
+    "No Audible Alarm": "1019",
+    "Unable to Obtain Readings": "1516",
+    "Device Displays Incorrect Message": "2591",
+    "High Readings": "2459",
+    "Low Readings": "2460",
+    "Adverse Event Without Identified Device or Use Problem": "2993",
+    "Detachment of Device or Device Component": "2907"
+  }
+}

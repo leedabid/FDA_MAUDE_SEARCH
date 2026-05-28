@@ -1,7 +1,8 @@
-# FDA MAUDE CGM Adverse Event Collector & Dashboard
+# FDA MAUDE Diabetes Device Adverse Event Collector & Dashboard
 
-Collect **adverse event reports (MDRs)** for continuous glucose monitors (CGMs) —
-Dexcom and Abbott FreeStyle Libre families — from the **FDA openFDA API (MAUDE)**,
+Collect **adverse event reports (MDRs)** for diabetes devices using
+manufacturer + brand targeting (CGM + insulin pump collected together) —
+from the **FDA openFDA API (MAUDE)**,
 store them in a local **SQLite database**, and explore them through an interactive
 **Streamlit dashboard**.
 
@@ -41,6 +42,7 @@ store them in a local **SQLite database**, and explore them through an interacti
 - **SQLite storage** with `report_number` as primary key (automatic de-duplication).
 - **Streamlit dashboard** with:
   - sidebar filters (brand, event type, date range, keyword, code search),
+  - brand-group management with an optional "hide already included brands" toggle,
   - an **Insights** tab (severity drill-down, escalation risk, manufacturer
     blind-spots, regulatory leading indicators, spike/new-code detection),
   - a **Full reports** tab with per-report detail and **per-code drill-down**,
@@ -192,7 +194,10 @@ All user-tunable settings live at the top of
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `CGM_BRANDS` | `["DEXCOM", "FREESTYLE LIBRE"]` | Brand substrings matched against `device.brand_name`. Add e.g. `"EVERSENSE"`, `"GUARDIAN"`. |
+| `SEARCH_MANUFACTURERS` | `["DEXCOM", "ABBOTT", "ABBOTT DIABETES CARE", "TANDEM", "TANDEM DIABETES CARE", "INSULET"]` | Search terms matched against `device.manufacturer_d_name`. |
+| `SEARCH_BRANDS` | `["FREESTYLE LIBRE", "DEXCOM", "OMNIPOD", "T:SLIM", "MINIMED 780G"]` | Search terms matched against `device.brand_name`. |
+| `CGM_BRANDS` | `SEARCH_MANUFACTURERS + SEARCH_BRANDS` | Compatibility key used for checkpoint versioning. |
+| `BRAND_CATEGORY_MAP` | built-in list | Maps brand_name patterns to `device_category` (e.g., `CGM`, `Insulin Pump`). |
 | `EVENT_TYPES` | `["Death", "Injury", "Other"]` | Which MAUDE event types to collect. Add `"Malfunction"` to include routine device-malfunction reports (volume explodes). |
 | `ONLY_ADVERSE_EVENTS` | `True` | If `True`, only reports with `adverse_event_flag = Y` (actual patient harm). |
 | `USE_FALLBACK_FIELDS` | `True` | If a brand search returns 0 hits, also try `generic_name` / `manufacturer_d_name`. |
@@ -200,15 +205,23 @@ All user-tunable settings live at the top of
 Brand grouping/aliasing for the dashboard is configured in
 [brand_groups.json](brand_groups.json). Manual term→code overrides live in
 [problem_code_map.json](problem_code_map.json).
+In the sidebar brand-group editor, you can toggle
+`그룹에 이미 포함된 브랜드는 제외하기` to hide or show already-selected members.
 
 ### 6.1 Customizing WHAT you collect
 
-By default this project searches **only Dexcom and FreeStyle Libre CGMs**. You can
+By default this project searches diabetes-device reports using
+**manufacturer OR brand** targeting for both **CGM + insulin pump** scope. You can
 retarget it to any company, device category, or the whole MAUDE database by editing
 the settings above. The search query the collector builds is roughly:
 
 ```
-device.brand_name:(...CGM_BRANDS...) AND date_received:[start TO end]
+(
+  device.manufacturer_d_name:(...SEARCH_MANUFACTURERS...)
+  OR
+  device.brand_name:(...SEARCH_BRANDS...)
+)
+AND date_received:[start TO end]
         AND event_type:(...EVENT_TYPES...) AND adverse_event_flag:Y
 ```
 
@@ -225,13 +238,12 @@ device.brand_name:(...CGM_BRANDS...) AND date_received:[start TO end]
 > - Consider using a fresh DB file when you change scope significantly:
 >   `python fda_maude_collector.py --initial --db my_search.db --excel my_search.xlsx`.
 
-**Recipe A — a different company / product** (substring match on `device.brand_name`,
+**Recipe A — a different company / product** (substring match on manufacturer/brand,
 case-insensitive):
 
 ```python
-CGM_BRANDS = ["MEDTRONIC"]               # e.g. Medtronic devices
-# or
-CGM_BRANDS = ["OMNIPOD", "TANDEM"]       # insulin pumps
+SEARCH_MANUFACTURERS = ["MEDTRONIC"]                 # e.g. manufacturer scope
+SEARCH_BRANDS = ["MINIMED 780G", "MINIMED 770G"]     # specific products
 ```
 
 If a brand searches poorly (manufacturer ≠ brand string), also rely on the
@@ -322,7 +334,8 @@ diagnose.bat                 print Python/PATH info (for troubleshooting)
 Run run_collector.bat → script checks the DB checkpoint
   ├─ no checkpoint (first run)        → backfill the last ~2 years
   ├─ checkpoint exists (normal run)   → from (last end date − 1 day) to today
-  └─ CGM_BRANDS list changed          → switch to a new checkpoint, re-backfill
+  └─ SEARCH_MANUFACTURERS / SEARCH_BRANDS changed
+                                      → switch to a new checkpoint, re-backfill
 ```
 
 The 1-day overlap guards against partial same-day FDA updates; duplicate
@@ -370,6 +383,7 @@ Key columns stored per report (see [fda_maude_collector.py](fda_maude_collector.
 | `event_type` | Death / Injury / Malfunction / Other |
 | `date_received` / `date_of_event` | FDA receipt date / actual event date |
 | `brand_name` / `generic_name` | Product / generic name |
+| `device_category` | Derived category label (e.g., `CGM`, `Insulin Pump`) |
 | `manufacturer_name` / `manufacturer_country` | Manufacturer and country |
 | `model_number` / `product_code` | Model and FDA product code |
 | `source_type` | Reporter (Manufacturer / Consumer / HCP) |

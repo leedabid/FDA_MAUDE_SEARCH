@@ -5,6 +5,95 @@ Newest entries first.
 
 ---
 
+## 2026-05-28
+
+### [Fix] "Hide already-grouped brands" toggle — corrected meaning + reliability (resolves earlier Known Issue)
+
+- **What the user actually wanted:** `그룹에 이미 포함된 브랜드는 제외하기` should hide
+  brands that are **already assigned to a saved group**, so that when building a
+  **new** group the list shows only *unassigned* brands. The previous build hid only
+  brands *checked in the current session*, so in `새 그룹 만들기` mode (nothing checked)
+  the toggle did nothing — all grouped brands kept showing.
+- **New behavior:**
+  - Hides every brand that is a member of any **saved** group in `brand_groups.json`,
+    **except** the group currently being edited (its own members stay visible so you
+    can edit them). Brands you check in the current session also stay visible.
+  - New-group mode: enabling the toggle hides all grouped brands; only unassigned
+    brands remain to pick from.
+- **Reliability root cause (also fixed):** visibility used the per-checkbox *widget*
+  state (`brand_group_member_cb::<brand>`), which Streamlit garbage-collects for
+  non-rendered widgets → hidden members reappeared on later reruns. The selection's
+  single source of truth is now the plain session key `brand_group_members`; the
+  hide set is computed from saved groups. All comparisons use `_norm_member`
+  (strip + collapse-space + upper). Each checkbox's state is synced from the source
+  of truth immediately before instantiation.
+- **Also fixed:** loading an existing group matches saved members against actual DB
+  brand names with the same normalized comparison (handles spacing/case drift).
+- **Verified** with Streamlit `AppTest` (headless): (A) new-group mode — visible
+  members dropped 200→52 with 0 grouped brands leaking; (B) editing `Omnipod5` —
+  its 12 own members stayed visible while every other group's members were hidden.
+  No exceptions.
+
+### [Known Issue] Brand-group hide-selected toggle not working reliably *(superseded by the Fix above)*
+
+- User reported that `그룹에 이미 포함된 브랜드는 제외하기` did not hide
+  already-included brands in some flows (especially `새 그룹 만들기` mode).
+- Resolved 2026-05-28 — see the `[Fix]` entry above.
+
+### [Dashboard] Brand group member-list visibility toggle
+
+- Added sidebar option `그룹에 이미 포함된 브랜드는 제외하기` in the brand group editor.
+- When enabled, already-selected members are hidden from the checkbox list;
+  when disabled, they are shown again.
+- Fixed member comparison to use normalized values (`strip + upper`) so hiding
+  works even when spacing/case differs.
+
+### [Change] Collection target policy switched to manufacturer + brand
+
+- Updated collector search scope to:
+  - `device.manufacturer_d_name`: `TANDEM`, `TANDEM DIABETES CARE`, `INSULET`
+  - `device.brand_name`: `MINIMED 780G`
+- Main search now uses `(manufacturer OR brand)` as the primary clause.
+- Updated fallback manufacturer list accordingly.
+
+### [Change] Device category mapping for pump-focused scope
+
+- Updated `BRAND_CATEGORY_MAP` to classify pump-related terms including
+  `MINIMED 780G`, `INSULET`, `TANDEM`, `T:SLIM`, `OMNIPOD` as `Insulin Pump`.
+
+### [Docs] README policy sync
+
+- Rewrote configuration and query examples to document the new
+  `SEARCH_MANUFACTURERS` + `SEARCH_BRANDS` model.
+
+### [Update] Dual-scope collection (CGM + Insulin Pump) enabled
+
+- Expanded default manufacturer/brand lists to collect CGM and insulin pump
+  together on every incremental run.
+- Restored CGM category mapping (`DEXCOM`, `FREESTYLE LIBRE`) while keeping pump
+  mappings (`OMNIPOD`, `T:SLIM`, `TANDEM`, `INSULET`, `MINIMED 780G`).
+
+## 2026-05-27
+
+### [Add] Insulin pump collection scope (Insulet Omnipod, Tandem t:slim X2 / MOBI / Control-IQ+)
+
+- Expanded `CGM_BRANDS` with `OMNIPOD`, `TANDEM`, `T:SLIM`.
+- Skipped standalone `MOBI` because it mostly matched ZimVie MOBI-C implant reports;
+  Tandem MOBI reports are captured via the `TANDEM` search.
+- Added `BRAND_CATEGORY_MAP` + `_resolve_device_category(brand_name)`.
+
+### [Schema] `device_category` column on `maude_reports`
+
+- Auto-migrated via `_migrate_schema()` for existing DBs.
+- Added index `idx_device_category`.
+- Excel export now includes `DEVICE_CATEGORY`.
+
+### [Dashboard] Device Category filter
+
+- Added `query_brands_by_category()` cache query.
+- Added sidebar `🩺 Device Category` multiselect (intersects with brand filter).
+- Added `DEVICE_CATEGORY` to report table and individual report detail panel.
+
 ## 2026-05-22
 
 ### Context: Problem Code display improvements (Annex A/E)

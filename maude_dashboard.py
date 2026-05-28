@@ -76,11 +76,18 @@ st.set_page_config(
 # DB 접근 유틸 (캐시 적용)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner=False)
 def _db_last_modified() -> float:
     if DB_PATH.exists():
         return DB_PATH.stat().st_mtime
     return 0.0
+
+
+def _db_signature() -> Tuple[bool, int, float]:
+    """DB 파일 변경 감지용 시그니처: (exists, size, mtime)."""
+    if not DB_PATH.exists():
+        return (False, 0, 0.0)
+    stt = DB_PATH.stat()
+    return (True, int(stt.st_size), float(stt.st_mtime))
 
 
 def _connect() -> sqlite3.Connection:
@@ -305,6 +312,12 @@ def normalize_brand_value(value: object, member_to_canonical: Dict[str, str]) ->
     return member_to_canonical.get(s.upper(), value)
 
 
+def _norm_member(s: object) -> str:
+    """브랜드 멤버 비교용 정규화(공백 1칸 + 대문자). 케이스/공백 차이로 인한
+    매칭 실패를 막기 위해 그룹 멤버 일치 판정에 일관되게 사용한다."""
+    return re.sub(r"\s+", " ", str(s or "").strip()).upper()
+
+
 def apply_brand_aliases(df: pd.DataFrame, member_to_canonical: Dict[str, str]) -> pd.DataFrame:
     """브랜드 칼럼이 있으면 대표명으로 치환해 집계 일관성 확보."""
     if df is None or df.empty or not member_to_canonical:
@@ -314,6 +327,32 @@ def apply_brand_aliases(df: pd.DataFrame, member_to_canonical: Dict[str, str]) -
     for col in alias_cols:
         if col in out.columns:
             out[col] = out[col].apply(lambda v: normalize_brand_value(v, member_to_canonical))
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def query_brands_by_category(mtime: float) -> Dict[str, List[str]]:
+    """device_category 칼럼이 있는 DB 에서 카테고리별 brand_name 목록을 반환.
+    구 DB(칼럼 없음) 의 경우 빈 dict 를 반환한다 — 카테고리 필터 비활성화 효과.
+    """
+    _ = mtime
+    if not DB_PATH.exists():
+        return {}
+    with _connect() as conn:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(maude_reports)").fetchall()}
+        if "device_category" not in cols:
+            return {}
+        rows = conn.execute(
+            "SELECT DISTINCT device_category, brand_name "
+            "FROM maude_reports "
+            "WHERE device_category IS NOT NULL AND device_category <> '' "
+            "  AND brand_name IS NOT NULL AND brand_name <> ''"
+        ).fetchall()
+    out: Dict[str, List[str]] = {}
+    for cat, bn in rows:
+        out.setdefault(cat, []).append(bn)
+    for cat in out:
+        out[cat].sort()
     return out
 
 
@@ -518,6 +557,7 @@ _REPORT_COLS: List[Tuple[str, str]] = [
     ("date_report",            "DATE_REPORT"),
     ("date_of_event",          "DATE_OF_EVENT"),
     ("brand_name",             "BRAND_NAME"),
+    ("device_category",        "DEVICE_CATEGORY"),
     ("manufacturer_name",      "MANUFACTURER"),
     ("manufacturer_country",   "COUNTRY"),
     ("patient_sex",            "SEX"),
@@ -2334,6 +2374,22 @@ if not DB_PATH.exists():
     )
     st.stop()
 
+# DB 파일을 교체한 경우(삭제 후 재수집 등) 캐시된 브랜드/카테고리 목록이
+# 남아 있을 수 있으므로 수동 새로고침 버튼을 제공한다.
+if st.sidebar.button("🔄 DB 필터 목록 새로고침", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
+
+# DB 파일 변경(추가/삭제/교체/증분 수집 반영)을 자동 감지해서 캐시를 갱신한다.
+current_db_sig = _db_signature()
+prev_db_sig = st.session_state.get("_db_signature")
+if prev_db_sig is None:
+    st.session_state["_db_signature"] = current_db_sig
+elif prev_db_sig != current_db_sig:
+    st.session_state["_db_signature"] = current_db_sig
+    st.cache_data.clear()
+    st.rerun()
+
 mtime = _db_last_modified()
 all_brands, all_event_types, min_date, max_date, total_reports = load_metadata(mtime)
 BRAND_GROUPS = load_brand_groups()
@@ -2413,11 +2469,15 @@ with st.sidebar:
         loaded_target = st.session_state.get("_brand_group_loaded_target")
         if loaded_target != edit_target:
             st.session_state["brand_group_canonical_name"] = default_name
-            st.session_state["brand_group_members"] = list(default_members)
+            # 저장된 그룹 멤버를 실제 DB 브랜드값과 정규화 비교로 매칭한다.
+            # (brand_groups.json 의 표기가 DB 의 띄어쓰기/대소문자와 달라도 선택되도록)
+            default_norm = {_norm_member(m) for m in default_members}
+            matched_members = [b for b in all_brands if _norm_member(b) in default_norm]
+            st.session_state["brand_group_members"] = matched_members
             # checkbox 키들도 같이 동기화(버튼 저장 후 '새 그룹 만들기'로 갈 때 초기화 보장)
-            selected_set = set(default_members)
+            matched_norm = {_norm_member(b) for b in matched_members}
             for b in all_brands:
-                st.session_state[f"brand_group_member_cb::{b}"] = b in selected_set
+                st.session_state[f"brand_group_member_cb::{b}"] = _norm_member(b) in matched_norm
             st.session_state["_brand_group_loaded_target"] = edit_target
 
         canonical_name = st.text_input(
@@ -2448,11 +2508,44 @@ with st.sidebar:
             step=50,
             key="brand_group_member_max",
         )
+        hide_selected_members = st.checkbox(
+            "그룹에 이미 포함된 브랜드는 제외하기",
+            value=False,
+            key="brand_group_hide_selected",
+            help="체크하면 **이미 저장된 다른 그룹에 배정된 브랜드**를 목록에서 숨겨, "
+                 "새 그룹에 넣을 미배정 브랜드만 보여줍니다. "
+                 "현재 편집 중인 그룹의 멤버와 이번에 체크한 브랜드는 계속 표시됩니다.",
+        )
 
-        visible_members = [
+        base_members = [
             b for b in all_brands
             if (not member_search) or (member_search.lower() in str(b).lower())
         ][: int(member_max)]
+
+        # 선택 상태의 단일 진실 공급원(source of truth)은 위젯 cb_key 가 아니라
+        # 평범한 세션 키 `brand_group_members` 다. (위젯 상태는 렌더링되지 않으면
+        # Streamlit 이 비결정적으로 정리해버려 "제외하기"가 들쭉날쭉해진다.)
+        selected_norm = {_norm_member(x) for x in st.session_state.get("brand_group_members", [])}
+
+        # "이미 포함된 브랜드 제외" = 이미 저장된 *다른* 그룹에 배정된 브랜드를 숨긴다.
+        # (현재 편집 중인 그룹 edit_target 의 멤버는 편집을 위해 계속 보여야 하므로 제외)
+        already_grouped_norm: Set[str] = set()
+        for _gname, _gmembers in BRAND_GROUPS.items():
+            if _gname == edit_target:
+                continue
+            for _m in _gmembers:
+                already_grouped_norm.add(_norm_member(_m))
+
+        # 핵심: 제외하기 체크 시, 다른 그룹에 이미 배정된 브랜드를 정규화 비교로 숨긴다.
+        # 단, 이번 세션에서 직접 체크한 브랜드(selected_norm)는 항상 보이게 유지.
+        if hide_selected_members:
+            visible_members = [
+                b for b in base_members
+                if _norm_member(b) not in already_grouped_norm
+                or _norm_member(b) in selected_norm
+            ]
+        else:
+            visible_members = base_members
 
         def _toggle_brand_member(brand: str) -> None:
             sel = set(st.session_state.get("brand_group_members", []))
@@ -2465,13 +2558,12 @@ with st.sidebar:
 
         # 멀티셀렉트 대신 checkbox 목록을 써서,
         # '이미 선택된 항목'도 목록에 보이면서 파스텔로 강조되도록 구현합니다.
+        # 각 체크박스 상태는 렌더링 직전에 source of truth 로부터 동기화한다.
         for b in visible_members:
             cb_key = f"brand_group_member_cb::{b}"
-            if cb_key not in st.session_state:
-                st.session_state[cb_key] = b in set(st.session_state.get("brand_group_members", []))
+            st.session_state[cb_key] = _norm_member(b) in selected_norm
             st.checkbox(
                 b,
-                value=st.session_state.get(cb_key, False),
                 key=cb_key,
                 label_visibility="visible",
                 on_change=lambda bb=b: _toggle_brand_member(bb),
@@ -2555,7 +2647,22 @@ with st.sidebar:
     if applied_max_rows > 50000:
         applied_max_rows = 50000
 
+    # 카테고리(CGM / Insulin Pump) 옵션은 DB 의 device_category 칼럼에서 추출.
+    # 구 DB(칼럼 없음) 일 때는 빈 dict 가 반환돼 자동으로 위젯이 비활성화됨.
+    _cat_map = query_brands_by_category(mtime)
+    _cat_options = sorted(_cat_map.keys())
+    _applied_categories = list(applied.get("categories", [])) if applied else []
+
     with st.form("filter_form", clear_on_submit=False):
+        if _cat_options:
+            form_categories = st.multiselect(
+                "🩺 디바이스 카테고리 (CGM / Insulin Pump)",
+                options=_cat_options,
+                default=_applied_categories,
+                help="여러 개 선택 가능. 비우면 전체. 브랜드와 함께 선택하면 교집합으로 좁혀집니다.",
+            )
+        else:
+            form_categories = []  # 구 DB 호환
         form_brands = st.multiselect(
             "브랜드 (여러 개 선택 가능, 비우면 전체)",
             options=display_brands,
@@ -2627,6 +2734,7 @@ with st.sidebar:
             d_from, d_to = default_from, default_to
         st.session_state.applied_filters = {
             "brands": form_brands,
+            "categories": form_categories,
             "event_types": form_events,
             "date_from": d_from,
             "date_to": d_to,
@@ -2637,6 +2745,9 @@ with st.sidebar:
             "max_rows": int(form_max_rows),
         }
         st.session_state.filter_applied = True
+        # Form submit 직후 즉시 rerun 해서 같은 run 에서 stale applied_filters 를
+        # 읽는 경로를 방지한다(필터가 두 번 눌려야 반영되는 현상 완화).
+        st.rerun()
 
     if not st.session_state.get("filter_applied", False):
         st.info("🔍 필터를 설정한 후 '필터 적용' 버튼을 클릭하세요")
@@ -2644,6 +2755,7 @@ with st.sidebar:
 
     applied = st.session_state.applied_filters
     sel_brands = list(applied.get("brands", []))
+    sel_categories = list(applied.get("categories", []))
     sel_events = list(applied.get("event_types", []))
     date_from = applied.get("date_from") or default_from
     date_to = applied.get("date_to") or default_to
@@ -2670,9 +2782,35 @@ with st.sidebar:
     seen_expand: Set[str] = set()
     sel_brands_query = [b for b in sel_brands_expanded if not (b in seen_expand or seen_expand.add(b))]
 
+    # 카테고리 선택을 brand 목록으로 확장 (device_category 칼럼 기반)
+    # - 카테고리만 선택: 해당 카테고리의 모든 brand_name 으로 sel_brands_query 설정
+    # - 카테고리 + 브랜드 둘 다 선택: 교집합 (선택 브랜드 중 그 카테고리에 속하는 것만)
+    # - 카테고리 미선택: 기존 동작 유지
+    category_brand_conflict = False
+    if sel_categories:
+        _cat_map_all = query_brands_by_category(mtime)
+        _cat_brands: List[str] = []
+        _cat_seen: Set[str] = set()
+        for cat in sel_categories:
+            for b in _cat_map_all.get(cat, []):
+                if b not in _cat_seen:
+                    _cat_brands.append(b)
+                    _cat_seen.add(b)
+        if sel_brands_query:
+            _cat_upper = {b.upper() for b in _cat_brands}
+            sel_brands_query = [b for b in sel_brands_query if b.upper() in _cat_upper]
+            # 카테고리+브랜드를 동시에 선택했는데 교집합이 비면
+            # "브랜드 필터 없음(전체)"로 해석되지 않도록 강제 0건 처리.
+            if not sel_brands_query:
+                category_brand_conflict = True
+                sel_brands_query = ["__NO_MATCH_BRAND__"]
+        else:
+            sel_brands_query = _cat_brands
+
     st.session_state.run_queries = True
 
     with st.expander("📊 현재 필터 상태", expanded=False):
+        st.write(f"**디바이스 카테고리:** {', '.join(sel_categories) if sel_categories else '(전체)'}")
         st.write(f"**브랜드:** {', '.join(sel_brands) if sel_brands else '(전체)'}")
         st.write(f"**EVENT_TYPE:** {', '.join(sel_events) if sel_events else '(전체)'}")
         st.write(f"**날짜 범위:** {date_from} ~ {date_to}")
@@ -2690,6 +2828,8 @@ with st.sidebar:
             + ("초기 보고" if report_stage == "initial" else ("후속 수정" if report_stage == "followup" else "(전체)"))
         )
         st.write(f"**최대 표시 건수:** {max_rows:,}건")
+    if category_brand_conflict:
+        st.warning("선택한 디바이스 카테고리와 브랜드의 교집합이 없어 결과는 0건입니다.")
 
     # 이후 쿼리 함수에는 코드 필터를 포함한 keyword 를 공통 전달.
     keyword = query_keyword
@@ -2738,19 +2878,24 @@ if filtered_total == 0:
 # ---------------------------------------------------------------------------
 
 if st.session_state.run_queries:
+        page_options = [
+            "🔍 인사이트",
+            "📋 전체 보고서",
+            "⚠️ EVENT_TYPE 분포",
+            "🏥 문제 코드",
+            "👤 환자 인구통계",
+            "🏭 제조사 · 국가",
+            "📈 월별 추이",
+        ]
+        if "active_page" not in st.session_state or st.session_state.active_page not in page_options:
+            st.session_state.active_page = page_options[0]
         page = st.sidebar.radio(
             "화면 선택",
-            [
-                "🔍 인사이트",
-                "📋 전체 보고서",
-                "⚠️ EVENT_TYPE 분포",
-                "🏥 문제 코드",
-                "👤 환자 인구통계",
-                "🏭 제조사 · 국가",
-                "📈 월별 추이",
-            ],
+            page_options,
+            index=page_options.index(st.session_state.active_page),
             key="page_select",
         )
+        st.session_state.active_page = page
 
         # ---------------- 탭 1: 🔍 인사이트 (A+C: 개발 리스크 회피 + 규제 선제 대응)
         # 다른 탭들은 descriptive(현상 기술)이지만 이 탭은 diagnostic(진단/예측).
@@ -3400,7 +3545,11 @@ if st.session_state.run_queries:
                     c1, c2 = st.columns(2)
                     with c1:
                         st.markdown(f"**EVENT_TYPE:** {row['EVENT_TYPE']}")
-                        st.markdown(f"**BRAND:** {row['BRAND_NAME']}")
+                        _cat = row.get("DEVICE_CATEGORY") if hasattr(row, "get") else (row["DEVICE_CATEGORY"] if "DEVICE_CATEGORY" in row.index else None)
+                        _brand_line = f"**BRAND:** {row['BRAND_NAME']}"
+                        if _cat:
+                            _brand_line += f"  · 🩺 **{_cat}**"
+                        st.markdown(_brand_line)
                         st.markdown(f"**MANUFACTURER:** {row['MANUFACTURER']} ({row['COUNTRY'] or 'N/A'})")
                         st.markdown(f"**DATE_RECEIVED:** {row['DATE_RECEIVED']} · DATE_OF_EVENT: {row['DATE_OF_EVENT']}")
                         st.markdown(

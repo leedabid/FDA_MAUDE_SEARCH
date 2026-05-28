@@ -64,23 +64,62 @@ except Exception:
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# [설정 1] 검색할 CGM 브랜드 목록
+# [설정 1] 검색할 당뇨 디바이스 조건 (제조사 + 브랜드)
 # ---------------------------------------------------------------------------
-# openFDA 의 device.brand_name 필드에서 이 문자열이 들어간 보고서를 찾습니다.
-# 따옴표 안의 단어가 모두 포함된 제품명만 매칭됩니다. 대소문자 무관.
-#
-# 예시:
-#   "DEXCOM"          → DEXCOM G6 CGM SYSTEM, DEXCOM G7, DEXCOM ONE 등 모두 매칭
-#   "FREESTYLE LIBRE" → FREESTYLE LIBRE, FREESTYLE LIBRE 2, FREESTYLE LIBRE 3 등
-#   "MEDTRONIC"       → 추가하고 싶으면 목록에 넣기
-#
-# 브랜드를 추가/제거하려면 아래 리스트만 고치면 됩니다.
-CGM_BRANDS: List[str] = [
-    "DEXCOM",           # Dexcom G5/G6/G7/ONE 전 시리즈
-    "FREESTYLE LIBRE",  # Abbott FreeStyle Libre 전 시리즈 (Libre 1/2/3/Pro)
-    # "EVERSENSE",      # 필요 시 주석 해제
-    # "GUARDIAN",       # Medtronic Guardian Sensor
+# 제조사/브랜드를 OR 로 묶어 검색합니다.
+#   (manufacturer_d_name IN SEARCH_MANUFACTURERS)
+#   OR (brand_name IN SEARCH_BRANDS)
+SEARCH_MANUFACTURERS: List[str] = [
+    "DEXCOM",
+    "ABBOTT",
+    "ABBOTT DIABETES CARE",
+    "TANDEM",
+    "TANDEM DIABETES CARE",
+    "INSULET",
 ]
+SEARCH_BRANDS: List[str] = [
+    "FREESTYLE LIBRE",
+    "DEXCOM",
+    "OMNIPOD",
+    "T:SLIM",
+    "MINIMED 780G",
+]
+
+# 체크포인트 키/기존 함수 시그니처 호환을 위해 유지합니다.
+CGM_BRANDS: List[str] = SEARCH_MANUFACTURERS + SEARCH_BRANDS
+
+# ---------------------------------------------------------------------------
+# [설정 1-b] 브랜드 → 디바이스 카테고리 매핑
+# ---------------------------------------------------------------------------
+# 위 CGM_BRANDS 로 수집된 각 보고서를 device_category 칼럼("CGM" / "Insulin Pump")
+# 으로 분류해 DB 에 저장합니다. brand_name 에 대해 위에서부터 차례로 부분일치
+# 검사하여 첫 매치를 사용합니다 (대소문자 무관).
+#
+# 주의: 순서가 중요합니다.
+#   - DEXCOM 이 MOBI 보다 먼저 와야 "DEXCOM MOBILE APP" 류가 MOBI=Pump 로
+#     오분류되지 않습니다.
+BRAND_CATEGORY_MAP: List[Tuple[str, str]] = [
+    ("DEXCOM",          "CGM"),
+    ("FREESTYLE LIBRE", "CGM"),
+    ("MINIMED 780G",    "Insulin Pump"),
+    ("OMNIPOD",         "Insulin Pump"),
+    ("T:SLIM",          "Insulin Pump"),
+    ("TANDEM",          "Insulin Pump"),
+    ("INSULET",         "Insulin Pump"),
+]
+
+
+def _resolve_device_category(brand_name: Optional[str]) -> Optional[str]:
+    """brand_name 으로부터 디바이스 카테고리("CGM" / "Insulin Pump") 추론.
+    매치 안 되면 None (DB 에는 NULL).
+    """
+    if not brand_name:
+        return None
+    upper = str(brand_name).upper()
+    for needle, cat in BRAND_CATEGORY_MAP:
+        if needle in upper:
+            return cat
+    return None
 
 # ---------------------------------------------------------------------------
 # [설정 2] 수집할 EVENT_TYPE (★★★ 볼륨이 너무 크면 여기부터 조정 ★★★)
@@ -121,6 +160,11 @@ FALLBACK_GENERIC_NAMES: List[str] = [
 FALLBACK_MANUFACTURERS: List[str] = [
     "DEXCOM",
     "ABBOTT",
+    "ABBOTT DIABETES CARE",
+    "TANDEM",
+    "TANDEM DIABETES CARE",
+    "INSULET",
+    "MEDTRONIC",
 ]
 
 # ---------------------------------------------------------------------------
@@ -202,6 +246,7 @@ CREATE TABLE IF NOT EXISTS maude_reports (
     date_of_event          TEXT,                -- 실제 사건 발생일
     date_report            TEXT,                -- 제조사 보고일
     brand_name             TEXT,                -- 제품명 (예: DEXCOM G7)
+    device_category        TEXT,                -- 디바이스 카테고리 (CGM / Insulin Pump)
     generic_name           TEXT,                -- 일반명 (예: Continuous Glucose Monitor)
     manufacturer_name      TEXT,                -- 제조사
     manufacturer_country   TEXT,                -- 제조사 소재 국가
@@ -241,6 +286,7 @@ CREATE TABLE IF NOT EXISTS collection_checkpoint (
 SCHEMA_INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_event_type      ON maude_reports(event_type);
 CREATE INDEX IF NOT EXISTS idx_brand           ON maude_reports(brand_name);
+CREATE INDEX IF NOT EXISTS idx_device_category ON maude_reports(device_category);
 CREATE INDEX IF NOT EXISTS idx_manufacturer    ON maude_reports(manufacturer_name);
 CREATE INDEX IF NOT EXISTS idx_mfr_country     ON maude_reports(manufacturer_country);
 CREATE INDEX IF NOT EXISTS idx_date_received   ON maude_reports(date_received);
@@ -386,9 +432,14 @@ def _compose_query(primary_clause: str, start: datetime, end: datetime) -> str:
 
 
 def build_search_query(start: datetime, end: datetime) -> str:
-    """메인 검색 쿼리: device.brand_name + 부작용 필터."""
-    brand = _build_or_clause("device.brand_name", CGM_BRANDS)
-    return _compose_query(brand, start, end)
+    """메인 검색 쿼리: (manufacturer OR brand) + 부작용 필터."""
+    clauses: List[str] = []
+    if SEARCH_MANUFACTURERS:
+        clauses.append(_build_or_clause("device.manufacturer_d_name", SEARCH_MANUFACTURERS))
+    if SEARCH_BRANDS:
+        clauses.append(_build_or_clause("device.brand_name", SEARCH_BRANDS))
+    primary = " OR ".join(f"({c})" for c in clauses if c)
+    return _compose_query(primary, start, end)
 
 
 def build_fallback_queries(start: datetime, end: datetime) -> List[Tuple[str, str]]:
@@ -629,7 +680,7 @@ def fetch_events(
     """
     # 1) 메인 쿼리 먼저 시도
     main_search = build_search_query(start, end)
-    log.info("메인 쿼리 시도 (device.brand_name + 부작용 필터)")
+    log.info("메인 쿼리 시도 ((device.manufacturer_d_name OR device.brand_name) + 부작용 필터)")
     if verbose:
         log.info("search=%s", main_search)
     total = _probe_query(main_search, api_key, verbose=verbose)
@@ -637,13 +688,16 @@ def fetch_events(
 
     chosen_primary: Optional[str] = None
     if total > 0:
-        chosen_primary = _build_or_clause("device.brand_name", CGM_BRANDS)
+        chosen_primary = " OR ".join([
+            f"({_build_or_clause('device.manufacturer_d_name', SEARCH_MANUFACTURERS)})",
+            f"({_build_or_clause('device.brand_name', SEARCH_BRANDS)})",
+        ])
 
     # 2) 0건이면 fallback
     if total == 0 and USE_FALLBACK_FIELDS:
         log.warning("메인 쿼리 0건 → fallback 쿼리 시도")
         fallback_primaries = [
-            ("openfda.brand_name", _build_or_clause("openfda.brand_name", CGM_BRANDS)),
+            ("openfda.brand_name", _build_or_clause("openfda.brand_name", SEARCH_BRANDS)),
         ]
         if FALLBACK_MANUFACTURERS:
             fallback_primaries.append((
@@ -798,6 +852,7 @@ def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         "date_of_event": _normalize_date(ev.get("date_of_event")),
         "date_report": _normalize_date(ev.get("date_report")),
         "brand_name": dev.get("brand_name"),
+        "device_category": _resolve_device_category(dev.get("brand_name")),
         "generic_name": dev.get("generic_name"),
         "manufacturer_name": (
             dev.get("manufacturer_d_name")
@@ -836,6 +891,7 @@ _TARGET_COLUMNS: List[Tuple[str, str]] = [
     ("date_of_event",          "TEXT"),
     ("date_report",            "TEXT"),
     ("brand_name",             "TEXT"),
+    ("device_category",        "TEXT"),
     ("generic_name",           "TEXT"),
     ("manufacturer_name",      "TEXT"),
     ("manufacturer_country",   "TEXT"),
@@ -1006,7 +1062,7 @@ def upsert_report(conn: sqlite3.Connection, row: Dict[str, Any]) -> bool:
 
     columns = [
         "report_number", "event_type", "date_received", "date_of_event", "date_report",
-        "brand_name", "generic_name", "manufacturer_name", "manufacturer_country",
+        "brand_name", "device_category", "generic_name", "manufacturer_name", "manufacturer_country",
         "model_number", "product_code",
         "source_type", "report_source_code",
         "type_of_report",
@@ -1041,6 +1097,7 @@ _EXCEL_MAIN_COLUMNS: List[Tuple[str, str]] = [
     ("DATE_RECEIVED", "date_received"),
     ("DATE_OF_EVENT", "date_of_event"),
     ("BRAND_NAME", "brand_name"),
+    ("DEVICE_CATEGORY", "device_category"),
     ("GENERIC_NAME", "generic_name"),
     ("MANUFACTURER", "manufacturer_name"),
     ("MANUFACTURER_COUNTRY", "manufacturer_country"),
@@ -1253,7 +1310,7 @@ def run_test_mode(api_key: Optional[str]) -> int:
     log.info("\n[2] 연도별 건수 (Dexcom + Libre)")
     log.info("  (전체 = 모든 보고서 / 부작용 = EVENT_TYPE %s + adverse_event_flag=%s)",
              EVENT_TYPES or "전체", "Y" if ONLY_ADVERSE_EVENTS else "전체")
-    brand_or = _build_or_clause("device.brand_name", CGM_BRANDS)
+    brand_or = _build_or_clause("device.brand_name", SEARCH_BRANDS)
     filter_clause = ""
     fc = _filter_clauses()
     if fc:

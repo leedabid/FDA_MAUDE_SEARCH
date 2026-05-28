@@ -21,6 +21,9 @@ maude_insight_report_*.xlsx
 # Personal / local analysis files (not part of the tool)
 Dexcom_libre_*.xlsx
 
+# Internal AI handoff doc — contains local machine paths/username, keep local only
+HANDOFF.md
+
 # Temporary working dirs
 tmp_maude_xlsx_unzip/
 tmp/
@@ -52,6 +55,7 @@ dist/
 .vscode/
 .idea/
 .gemini/
+.claude/
 *.swp
 .DS_Store
 Thumbs.db

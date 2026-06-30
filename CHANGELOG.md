@@ -5,6 +5,24 @@ Newest entries first.
 
 ---
 
+## 2026-06-29
+
+### [Fix] Filter submit now applies on the first click
+
+- Split Streamlit sidebar filter state into `pending_filters` and `applied_filters` so the query path always reads the committed values.
+- Kept empty brand/category intersections as 0-row results instead of falling back to all data.
+- Added a cap-safe KPI count path so the top metric stays responsive on large result sets.
+
+---
+
+### [Change] Legacy CGM category backfill + composite indexes
+
+- Backfilled legacy `device_category IS NULL` rows to `CGM` when brand/generic/manufacturer/product-code evidence clearly matches Dexcom / Libre family terms.
+- Logged pre/post NULL counts and remaining NULL top rows during DB initialization.
+- Added composite indexes for `date_received`, `event_type`, `device_category + date_received`, `brand_name + date_received`, and `manufacturer_name + date_received`.
+
+---
+
 ## 2026-05-28
 
 ### [Fix] "Hide already-grouped brands" toggle — corrected meaning + reliability (resolves earlier Known Issue)

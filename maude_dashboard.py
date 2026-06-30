@@ -36,6 +36,7 @@ import io
 import hashlib
 import json
 import re
+import requests
 import sqlite3
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
@@ -93,8 +94,9 @@ def _db_signature() -> Tuple[bool, int, float]:
 def _connect() -> sqlite3.Connection:
     """읽기 전용 connection. 캐시 무효화를 위해 파일 mtime 을 키로 사용."""
     _ = _db_last_modified()  # mtime 체크만
-    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
-
+    conn = sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro&immutable=1", uri=True, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
 def _parse_code_numbers(raw: str) -> List[str]:
     """코드 입력 문자열에서 숫자 코드 목록(2~6자리)을 추출."""
@@ -394,6 +396,8 @@ def _parse_iso_date(s: str) -> Optional[date]:
     return None
 
 
+
+
 def _build_where(
     brands: List[str],
     event_types: List[str],
@@ -454,21 +458,26 @@ def _build_where(
     if keyword_text:
         like = f"%{keyword_text}%"
         mdr_key_like = f'%\"mdr_report_key\"%{keyword_text}%'
-        # summary 칼럼은 구 DB 에도 존재하므로 항상 포함 가능
-        clauses.append(
-            "("
-            "event_description LIKE ? OR "
-            "manufacturer_narrative LIKE ? OR "
-            "summary_complaint_kr LIKE ? OR "
-            "summary_response_kr LIKE ? OR "
-            "patient_problems LIKE ? OR "
-            "product_problems LIKE ? OR "
-            "COALESCE(report_number, '') LIKE ? OR "
-            "COALESCE(raw_json, '') LIKE ?"
-            ")"
-        )
-        params.extend([like] * 6 + [like, mdr_key_like])
-
+        available = set(detect_columns(_db_last_modified()))
+        text_clauses = [
+            "event_description LIKE ?",
+            "manufacturer_narrative LIKE ?",
+        ]
+        text_params = [like, like]
+        if "additional_manufacturer_narrative" in available:
+            text_clauses.append("additional_manufacturer_narrative LIKE ?")
+            text_params.append(like)
+        text_clauses.extend([
+            "summary_complaint_kr LIKE ?",
+            "summary_response_kr LIKE ?",
+            "patient_problems LIKE ?",
+            "product_problems LIKE ?",
+            "COALESCE(report_number, '') LIKE ?",
+            "COALESCE(raw_json, '') LIKE ?",
+        ])
+        text_params.extend([like] * 4 + [like, mdr_key_like])
+        clauses.append("(" + " OR ".join(text_clauses) + ")")
+        params.extend(text_params)
     if id_filters:
         per_id_clauses: List[str] = []
         for term in id_filters:
@@ -571,6 +580,7 @@ _REPORT_COLS: List[Tuple[str, str]] = [
     ("summary_conclusion_kr",  "[요약] 결론"),
     ("event_description",      "EVENT_DESCRIPTION (원문)"),
     ("manufacturer_narrative", "MANUFACTURER_NARRATIVE (원문)"),
+    ("additional_manufacturer_narrative", "ADDITIONAL_MANUFACTURER_NARRATIVE (원문)"),
     ("raw_json",               "__RAW_JSON"),
 ]
 
@@ -608,10 +618,17 @@ def query_reports(
         df = pd.read_sql_query(sql, conn, params=params)
     if "__RAW_JSON" in df.columns:
         def _extract_additional(raw: Optional[str]) -> str:
-            if not isinstance(raw, str) or "Additional Manufacturer Narrative" not in raw:
+            if not isinstance(raw, str) or "Manufacturer" not in raw:
                 return ""
             return _extract_narrative_sections(raw).get("additional_manufacturer_narrative", "")
-        df["ADDITIONAL_MANUFACTURER_NARRATIVE (원문)"] = df["__RAW_JSON"].apply(_extract_additional)
+        extracted_additional = df["__RAW_JSON"].apply(_extract_additional)
+        col = "ADDITIONAL_MANUFACTURER_NARRATIVE (원문)"
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+            missing = df[col].astype(str).str.strip() == ""
+            df.loc[missing, col] = extracted_additional[missing]
+        else:
+            df[col] = extracted_additional
         df = df.drop(columns=["__RAW_JSON"])
     elif "ADDITIONAL_MANUFACTURER_NARRATIVE (원문)" not in df.columns:
         df["ADDITIONAL_MANUFACTURER_NARRATIVE (원문)"] = ""
@@ -634,6 +651,56 @@ def query_filtered_count(
         ).fetchone()[0]
 
 
+@st.cache_data(show_spinner=False)
+def query_has_match(
+    mtime: float,
+    brands: List[str],
+    event_types: List[str],
+    date_from: Optional[date],
+    date_to: Optional[date],
+    keyword: str,
+) -> bool:
+    """필터 결과 존재 여부만 빠르게 확인 (0건 판정용)."""
+    where, params = _build_where(brands, event_types, date_from, date_to, keyword)
+    sql = f"SELECT 1 FROM maude_reports WHERE {where} LIMIT 1"
+    with _connect() as conn:
+        row = conn.execute(sql, params).fetchone()
+    return row is not None
+
+
+@st.cache_data(show_spinner=False)
+def query_filtered_count_capped(
+    mtime: float,
+    brands: List[str],
+    event_types: List[str],
+    date_from: Optional[date],
+    date_to: Optional[date],
+    keyword: str,
+    cap: int = 20000,
+) -> int:
+    """상단 KPI 표시용 빠른 건수(최대 cap까지만 계산)."""
+    where, params = _build_where(brands, event_types, date_from, date_to, keyword)
+    sql = f"""
+        SELECT COUNT(*) FROM (
+            SELECT 1
+            FROM maude_reports
+            WHERE {where}
+            LIMIT {int(cap)}
+        )
+    """
+    with _connect() as conn:
+        return int(conn.execute(sql, params).fetchone()[0])
+
+
+def _join_narrative_parts_for_display(parts: List[str]) -> str:
+    cleaned = [str(p).strip() for p in parts if str(p or "").strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return "\n\n".join(f"[{i}] {txt}" for i, txt in enumerate(cleaned, start=1))
+
+
 def _extract_narrative_sections(raw_json: Optional[str]) -> Dict[str, str]:
     """raw_json.mdr_text 를 파싱해 주요 내러티브 섹션을 분리한다."""
     out = {
@@ -648,16 +715,27 @@ def _extract_narrative_sections(raw_json: Optional[str]) -> Dict[str, str]:
     except Exception:
         return out
 
+    # openFDA payload 가 버전별로 조금씩 달라서 여러 형태를 모두 흡수한다.
+    text_blocks = []
+    if isinstance(payload, dict):
+        text_blocks.extend(payload.get("mdr_text", []) or [])
+        if isinstance(payload.get("mdr_text"), dict):
+            text_blocks.extend(payload.get("mdr_text", {}).get("text", []) or [])
+        if isinstance(payload.get("device"), list):
+            for dev in payload.get("device", []):
+                if isinstance(dev, dict) and isinstance(dev.get("mdr_text"), list):
+                    text_blocks.extend(dev.get("mdr_text", []))
+
     event_parts: List[str] = []
     mfr_parts: List[str] = []
     add_mfr_parts: List[str] = []
-    for item in payload.get("mdr_text", []) or []:
+    for item in text_blocks:
         if not isinstance(item, dict):
             continue
-        txt = str(item.get("text") or "").strip()
+        txt = str(item.get("text") or item.get("text_value") or "").strip()
         if not txt:
             continue
-        tcode = str(item.get("text_type_code") or "").strip().lower()
+        tcode = str(item.get("text_type_code") or item.get("type") or "").strip().lower()
         if "additional manufacturer narrative" in tcode:
             add_mfr_parts.append(txt)
         elif "manufacturer" in tcode:
@@ -665,25 +743,116 @@ def _extract_narrative_sections(raw_json: Optional[str]) -> Dict[str, str]:
         else:
             event_parts.append(txt)
 
-    out["event_description"] = "\n\n".join(event_parts).strip()
-    out["manufacturer_narrative"] = "\n\n".join(mfr_parts).strip()
-    out["additional_manufacturer_narrative"] = "\n\n".join(add_mfr_parts).strip()
+    out["event_description"] = _join_narrative_parts_for_display(event_parts)
+    out["manufacturer_narrative"] = _join_narrative_parts_for_display(mfr_parts)
+    out["additional_manufacturer_narrative"] = _join_narrative_parts_for_display(add_mfr_parts)
     return out
+
+
+def _fetch_fda_detail_narrative(report_number: str) -> Dict[str, str]:
+    """FDA AccessData detail page에서 원문 narrative를 보조적으로 추출한다."""
+    if not report_number:
+        return {"event_description": "", "manufacturer_narrative": "", "additional_manufacturer_narrative": ""}
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT raw_json FROM maude_reports WHERE report_number = ? LIMIT 1",
+                (str(report_number),),
+            ).fetchone()
+        if not row or not row[0]:
+            return {"event_description": "", "manufacturer_narrative": "", "additional_manufacturer_narrative": ""}
+        payload = json.loads(row[0])
+        mdr_report_key = str(payload.get("mdr_report_key") or "").strip()
+        device = (payload.get("device") or [{}])[0] if isinstance(payload.get("device"), list) and payload.get("device") else {}
+        pc = str(device.get("device_report_product_code") or "").strip()
+        seq = str(device.get("device_sequence_number") or "").strip()
+        url = "https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfmaude/detail.cfm"
+        params = {"mdrfoi__id": mdr_report_key or report_number, "pc": pc, "device_sequence_no": seq}
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        html = resp.text
+        def _grab(label: str) -> str:
+            pats = [
+                rf"{re.escape(label)}\s*</[^>]+>\s*<[^>]+>(.*?)</",
+                rf"{re.escape(label)}\s*:\s*(.*?)<",
+            ]
+            for pat in pats:
+                m = re.search(pat, html, flags=re.I | re.S)
+                if m:
+                    txt = re.sub(r"<[^>]+>", " ", m.group(1))
+                    txt = re.sub(r"\s+", " ", txt).strip()
+                    if txt:
+                        return txt
+            return ""
+        return {
+            "event_description": _grab("Event or Problem Description"),
+            "manufacturer_narrative": _grab("Manufacturer Narrative"),
+            "additional_manufacturer_narrative": _grab("Additional Manufacturer Narrative"),
+        }
+    except Exception:
+        return {"event_description": "", "manufacturer_narrative": "", "additional_manufacturer_narrative": ""}
 
 
 @st.cache_data(show_spinner=False)
 def query_report_narrative_sections(mtime: float, report_number: str) -> Dict[str, str]:
-    """개별 MAUDE 번호의 raw_json 에서 내러티브 섹션을 추출."""
+    """개별 MAUDE 번호의 원문 필드와 raw_json/FDA detail 페이지에서 내러티브 섹션을 추출."""
     _ = mtime
     if not report_number:
         return _extract_narrative_sections(None)
+    available = set(detect_columns(mtime))
+    additional_expr = "additional_manufacturer_narrative" if "additional_manufacturer_narrative" in available else "NULL"
     with _connect() as conn:
         row = conn.execute(
-            "SELECT raw_json FROM maude_reports WHERE report_number = ? LIMIT 1",
+            f"SELECT event_description, manufacturer_narrative, {additional_expr}, raw_json FROM maude_reports WHERE report_number = ? LIMIT 1",
             (str(report_number),),
         ).fetchone()
-    raw_json = row[0] if row else None
-    return _extract_narrative_sections(raw_json)
+    if not row:
+        return _extract_narrative_sections(None)
+    raw_json = row[3]
+    out = _extract_narrative_sections(raw_json)
+    if not out.get("event_description"):
+        out["event_description"] = row[0] or ""
+    if not out.get("manufacturer_narrative"):
+        out["manufacturer_narrative"] = row[1] or ""
+    if not out.get("additional_manufacturer_narrative"):
+        out["additional_manufacturer_narrative"] = row[2] or ""
+    if not out.get("event_description") or not out.get("manufacturer_narrative") or not out.get("additional_manufacturer_narrative"):
+        fda = _fetch_fda_detail_narrative(report_number)
+        if not out.get("event_description") and fda.get("event_description"):
+            out["event_description"] = fda["event_description"]
+        if not out.get("manufacturer_narrative") and fda.get("manufacturer_narrative"):
+            out["manufacturer_narrative"] = fda["manufacturer_narrative"]
+        if not out.get("additional_manufacturer_narrative") and fda.get("additional_manufacturer_narrative"):
+            out["additional_manufacturer_narrative"] = fda["additional_manufacturer_narrative"]
+    return out
+
+
+def _row_value(row: Optional[object], key: str) -> str:
+    if row is None:
+        return ""
+    try:
+        if hasattr(row, "get"):
+            value = row.get(key, "")
+        else:
+            value = row[key]
+    except Exception:
+        value = ""
+    if pd.isna(value):
+        return ""
+    return str(value)
+
+
+def _render_report_narratives(mtime: float, report_number: str, row: Optional[object] = None) -> None:
+    sections = query_report_narrative_sections(mtime, str(report_number)) if report_number else {}
+    narrative_fields = [
+        ("event_description", "EVENT_DESCRIPTION (원문)"),
+        ("manufacturer_narrative", "MANUFACTURER_NARRATIVE (원문)"),
+        ("additional_manufacturer_narrative", "ADDITIONAL_MANUFACTURER_NARRATIVE (원문)"),
+    ]
+    for section_key, label in narrative_fields:
+        value = sections.get(section_key) or _row_value(row, label) or "(없음)"
+        with st.expander(label):
+            st.text(value)
 
 
 @st.cache_data(show_spinner=False)
@@ -729,6 +898,186 @@ def query_code_fields(
         df = pd.read_sql_query(sql, conn, params=params)
     return format_problem_columns(apply_brand_aliases(df, MEMBER_TO_CANONICAL))
 
+
+@st.cache_data(show_spinner=False)
+def query_monthly_code_fields(
+    mtime: float,
+    brands: List[str],
+    event_types: List[str],
+    date_from: Optional[date],
+    date_to: Optional[date],
+    keyword: str,
+) -> pd.DataFrame:
+    """월별 상세 분석용 최소 필드만 로드."""
+    where, params = _build_where(brands, event_types, date_from, date_to, keyword)
+    sql = f"""
+        SELECT substr(date_received, 1, 7) AS 월,
+               event_type,
+               patient_problems,
+               product_problems
+        FROM maude_reports
+        WHERE {where}
+          AND date_received IS NOT NULL
+          AND date_received <> ''
+    """
+    with _connect() as conn:
+        df = pd.read_sql_query(sql, conn, params=params)
+    return format_problem_columns(df)
+
+
+def _format_problem_token(raw: object, domain: Optional[str]) -> str:
+    term, code = _extract_problem_term_code(raw)
+    if not term:
+        return ""
+    if code:
+        return f"{term} ({code})"
+    return _format_problem_term_with_code(term, domain=domain)
+
+
+def _monthly_top_codes_table(
+    df: pd.DataFrame,
+    code_col: str,
+    label: str,
+    domain: str,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    if df is None or df.empty or code_col not in df.columns or "월" not in df.columns:
+        return pd.DataFrame(columns=["월", "순위", label, "건수"])
+    rows: List[Dict[str, object]] = []
+    for month, raw in zip(df["월"], df[code_col]):
+        for token in _split_problem_terms(raw):
+            formatted = _format_problem_token(token, domain=domain)
+            if formatted:
+                rows.append({"월": month, label: formatted})
+    if not rows:
+        return pd.DataFrame(columns=["월", "순위", label, "건수"])
+    counts = (
+        pd.DataFrame(rows)
+        .groupby(["월", label], as_index=False)
+        .size()
+        .rename(columns={"size": "건수"})
+        .sort_values(["월", "건수", label], ascending=[True, False, True])
+    )
+    counts["순위"] = counts.groupby("월")["건수"].rank(method="first", ascending=False).astype(int)
+    return counts[counts["순위"] <= int(top_n)][["월", "순위", label, "건수"]]
+
+
+def _health_device_pair_frames(
+    df: pd.DataFrame,
+    top_n: int = 20,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if df is None or df.empty:
+        empty_pivot = pd.DataFrame(columns=[PATIENT_PROBLEM_LABEL])
+        return pd.DataFrame(columns=[PATIENT_PROBLEM_LABEL, DEVICE_PROBLEM_LABEL, "건수"]), empty_pivot
+    pair_counter: Counter[Tuple[str, str]] = Counter()
+    for _, row in df.iterrows():
+        health_codes = {
+            _format_problem_token(token, domain="patient")
+            for token in _split_problem_terms(row.get("patient_problems", ""))
+        }
+        device_codes = {
+            _format_problem_token(token, domain="device")
+            for token in _split_problem_terms(row.get("product_problems", ""))
+        }
+        health_codes.discard("")
+        device_codes.discard("")
+        for health in health_codes:
+            for device in device_codes:
+                pair_counter[(health, device)] += 1
+    if not pair_counter:
+        empty_pivot = pd.DataFrame(columns=[PATIENT_PROBLEM_LABEL])
+        return pd.DataFrame(columns=[PATIENT_PROBLEM_LABEL, DEVICE_PROBLEM_LABEL, "건수"]), empty_pivot
+
+    pair_df = pd.DataFrame(
+        [
+            {PATIENT_PROBLEM_LABEL: h, DEVICE_PROBLEM_LABEL: d, "건수": cnt}
+            for (h, d), cnt in pair_counter.items()
+        ]
+    )
+    top_health = (
+        pair_df.groupby(PATIENT_PROBLEM_LABEL)["건수"].sum().sort_values(ascending=False).head(top_n).index.tolist()
+    )
+    top_device = (
+        pair_df.groupby(DEVICE_PROBLEM_LABEL)["건수"].sum().sort_values(ascending=False).head(top_n).index.tolist()
+    )
+    filtered = pair_df[
+        pair_df[PATIENT_PROBLEM_LABEL].isin(top_health)
+        & pair_df[DEVICE_PROBLEM_LABEL].isin(top_device)
+    ].copy()
+    pivot = filtered.pivot_table(
+        index=PATIENT_PROBLEM_LABEL,
+        columns=DEVICE_PROBLEM_LABEL,
+        values="건수",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    pivot = pivot.reindex(index=top_health, columns=top_device, fill_value=0).reset_index()
+    return filtered.sort_values("건수", ascending=False), pivot
+
+
+def _build_health_device_network_chart(pair_df: pd.DataFrame, max_edges: int = 60) -> Optional[alt.Chart]:
+    if pair_df is None or pair_df.empty:
+        return None
+    edges = pair_df.sort_values("건수", ascending=False).head(max_edges).copy()
+    if edges.empty:
+        return None
+    health_order = (
+        edges.groupby(PATIENT_PROBLEM_LABEL)["건수"].sum().sort_values(ascending=False).index.tolist()
+    )
+    device_order = (
+        edges.groupby(DEVICE_PROBLEM_LABEL)["건수"].sum().sort_values(ascending=False).index.tolist()
+    )
+    health_rank = {name: i + 1 for i, name in enumerate(health_order)}
+    device_rank = {name: i + 1 for i, name in enumerate(device_order)}
+
+    edge_points: List[Dict[str, object]] = []
+    for idx, row in edges.reset_index(drop=True).iterrows():
+        edge_id = f"e{idx}"
+        health = row[PATIENT_PROBLEM_LABEL]
+        device = row[DEVICE_PROBLEM_LABEL]
+        count = int(row["건수"])
+        edge_points.append({"edge": edge_id, "x": 0, "rank": health_rank[health], "건수": count, "from": health, "to": device})
+        edge_points.append({"edge": edge_id, "x": 1, "rank": device_rank[device], "건수": count, "from": health, "to": device})
+
+    node_rows = [
+        {"x": 0, "rank": rank, "label": label, "side": "Health Effect"}
+        for label, rank in health_rank.items()
+    ] + [
+        {"x": 1, "rank": rank, "label": label, "side": "Device Problem"}
+        for label, rank in device_rank.items()
+    ]
+    max_rank = max([p["rank"] for p in edge_points] + [1])
+    height = max(420, max_rank * 28)
+
+    line = alt.Chart(pd.DataFrame(edge_points)).mark_line(opacity=0.35).encode(
+        x=alt.X("x:Q", scale=alt.Scale(domain=[-0.08, 1.08]), axis=None),
+        y=alt.Y("rank:Q", scale=alt.Scale(domain=[0.5, max_rank + 0.5], reverse=True), axis=None),
+        detail="edge:N",
+        size=alt.Size("건수:Q", legend=alt.Legend(title="연결 건수"), scale=alt.Scale(range=[1, 8])),
+        tooltip=[
+            alt.Tooltip("from:N", title=PATIENT_PROBLEM_LABEL),
+            alt.Tooltip("to:N", title=DEVICE_PROBLEM_LABEL),
+            alt.Tooltip("건수:Q"),
+        ],
+    )
+    node_df = pd.DataFrame(node_rows)
+    left_nodes = alt.Chart(node_df[node_df["x"] == 0]).mark_text(
+        fontSize=11, limit=360, align="right", dx=-8
+    ).encode(
+        x=alt.X("x:Q", scale=alt.Scale(domain=[-0.08, 1.08]), axis=None),
+        y=alt.Y("rank:Q", scale=alt.Scale(domain=[0.5, max_rank + 0.5], reverse=True), axis=None),
+        text="label:N",
+        tooltip=[alt.Tooltip("side:N"), alt.Tooltip("label:N")],
+    )
+    right_nodes = alt.Chart(node_df[node_df["x"] == 1]).mark_text(
+        fontSize=11, limit=360, align="left", dx=8
+    ).encode(
+        x=alt.X("x:Q", scale=alt.Scale(domain=[-0.08, 1.08]), axis=None),
+        y=alt.Y("rank:Q", scale=alt.Scale(domain=[0.5, max_rank + 0.5], reverse=True), axis=None),
+        text="label:N",
+        tooltip=[alt.Tooltip("side:N"), alt.Tooltip("label:N")],
+    )
+    return (line + left_nodes + right_nodes).properties(height=height)
 
 def _explode_codes(series: pd.Series, domain: Optional[str] = None) -> pd.Series:
     """세미콜론(;) 구분 문자열을 개별 코드 단위로 분리·정리.
@@ -1718,6 +2067,44 @@ def linked_line_and_table(
     st.altair_chart(chart, use_container_width=True, key=f"altair_linked_{key}" if key else None)
 
 
+def _build_smoothed_line_chart(df: pd.DataFrame, *, x_col: str, y_cols: List[str], title: str) -> alt.Chart:
+    """원시 선과 이동평균 스무딩 선을 함께 보여주는 Altair 차트."""
+    if df is None or df.empty or x_col not in df.columns or not y_cols:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_line()
+
+    plot = df[[x_col] + [c for c in y_cols if c in df.columns]].copy()
+    plot = plot.sort_values(x_col)
+    melted = plot.melt(id_vars=[x_col], var_name="series", value_name="value")
+    melted["value"] = pd.to_numeric(melted["value"], errors="coerce")
+
+    smoothed_frames: List[pd.DataFrame] = []
+    for col in y_cols:
+        if col not in plot.columns:
+            continue
+        tmp = plot[[x_col, col]].copy()
+        tmp[col] = pd.to_numeric(tmp[col], errors="coerce")
+        tmp["smoothed"] = tmp[col].rolling(window=3, center=True, min_periods=1).mean()
+        tmp = tmp.rename(columns={col: "raw"})
+        raw_df = tmp[[x_col, "raw"]].rename(columns={"raw": "value"})
+        raw_df["series"] = f"{col} (원본)"
+        raw_df["kind"] = "raw"
+        smooth_df = tmp[[x_col, "smoothed"]].rename(columns={"smoothed": "value"})
+        smooth_df["series"] = f"{col} (스무딩)"
+        smooth_df["kind"] = "smooth"
+        smoothed_frames.extend([raw_df, smooth_df])
+
+    chart_df = pd.concat(smoothed_frames, ignore_index=True)
+    base = alt.Chart(chart_df).encode(
+        x=alt.X(f"{x_col}:O", title="월"),
+        y=alt.Y("value:Q", title=title),
+        color=alt.Color("series:N", title="시리즈"),
+        tooltip=[alt.Tooltip(f"{x_col}:O", title="월"), alt.Tooltip("series:N", title="시리즈"), alt.Tooltip("value:Q", title="값")],
+    )
+    raw_line = base.transform_filter(alt.datum.kind == "raw").mark_line(point=True)
+    smooth_line = base.transform_filter(alt.datum.kind == "smooth").mark_line(strokeDash=[6, 4], strokeWidth=3)
+    return raw_line + smooth_line
+
+
 # ---------------------------------------------------------------------------
 # Excel 다운로드
 # ---------------------------------------------------------------------------
@@ -2617,22 +3004,29 @@ with st.sidebar:
     picker_max = max(max_date, today) if max_date else today
     picker_max = max(picker_max, today + timedelta(days=365))
 
-    # 필터는 form submit 시에만 반영
+    # 필터는 pending/applied 를 분리해서 관리한다.
+    # - pending_filters: form 위젯의 현재 편집값
+    # - applied_filters: 실제 쿼리에 사용하는 값
+    default_filters = {
+        "brands": [],
+        "categories": [],
+        "event_types": [],
+        "date_from": default_from,
+        "date_to": default_to,
+        "keyword": "",
+        "id_search": "",
+        "code_search": "",
+        "report_stage": "all",
+        "max_rows": 5000,
+    }
     if "applied_filters" not in st.session_state:
-        st.session_state.applied_filters = {
-            "brands": [],
-            "event_types": [],
-            "date_from": default_from,
-            "date_to": default_to,
-            "keyword": "",
-            "id_search": "",
-            "code_search": "",
-            "report_stage": "all",
-            "max_rows": 5000,
-        }
+        st.session_state.applied_filters = default_filters.copy()
         st.session_state.filter_applied = False
+    if "pending_filters" not in st.session_state:
+        st.session_state.pending_filters = st.session_state.applied_filters.copy()
 
     applied = st.session_state.applied_filters
+    pending = st.session_state.pending_filters
     applied_brands = [b for b in applied.get("brands", []) if b in display_brands]
     applied_events = [e for e in applied.get("event_types", []) if e in all_event_types]
     applied_from = applied.get("date_from") or default_from
@@ -2642,23 +3036,39 @@ with st.sidebar:
     applied_code_search = str(applied.get("code_search", "")).strip()
     applied_report_stage = _normalize_report_stage(applied.get("report_stage", "all"))
     applied_max_rows = int(applied.get("max_rows", 5000))
+    max_rows_cap = max(100, int(total_reports))
     if applied_max_rows < 100:
         applied_max_rows = 100
-    if applied_max_rows > 50000:
-        applied_max_rows = 50000
+    if applied_max_rows > max_rows_cap:
+        applied_max_rows = max_rows_cap
 
     # 카테고리(CGM / Insulin Pump) 옵션은 DB 의 device_category 칼럼에서 추출.
     # 구 DB(칼럼 없음) 일 때는 빈 dict 가 반환돼 자동으로 위젯이 비활성화됨.
     _cat_map = query_brands_by_category(mtime)
     _cat_options = sorted(_cat_map.keys())
     _applied_categories = list(applied.get("categories", [])) if applied else []
+    pending_brands = [b for b in pending.get("brands", []) if b in display_brands]
+    pending_categories = [c for c in pending.get("categories", []) if c in _cat_options]
+    pending_events = [e for e in pending.get("event_types", []) if e in all_event_types]
+    pending_from = pending.get("date_from") or default_from
+    pending_to = pending.get("date_to") or default_to
+    pending_kw = str(pending.get("keyword", "")).strip()
+    pending_id_search = str(pending.get("id_search", "")).strip()
+    pending_code_search = str(pending.get("code_search", "")).strip()
+    pending_report_stage = _normalize_report_stage(pending.get("report_stage", "all"))
+    pending_max_rows = int(pending.get("max_rows", 5000))
+    if pending_max_rows < 100:
+        pending_max_rows = 100
+    if pending_max_rows > max_rows_cap:
+        pending_max_rows = max_rows_cap
 
     with st.form("filter_form", clear_on_submit=False):
         if _cat_options:
             form_categories = st.multiselect(
                 "🩺 디바이스 카테고리 (CGM / Insulin Pump)",
                 options=_cat_options,
-                default=_applied_categories,
+                default=pending_categories,
+                key="pending_categories",
                 help="여러 개 선택 가능. 비우면 전체. 브랜드와 함께 선택하면 교집합으로 좁혀집니다.",
             )
         else:
@@ -2666,18 +3076,21 @@ with st.sidebar:
         form_brands = st.multiselect(
             "브랜드 (여러 개 선택 가능, 비우면 전체)",
             options=display_brands,
-            default=applied_brands,
+            default=pending_brands,
+            key="pending_brands",
             help="그룹 대표명을 설정한 경우 대표명 기준으로 표시됩니다.",
         )
         form_events = st.multiselect(
             "EVENT_TYPE",
             options=all_event_types,
-            default=applied_events,
+            default=pending_events,
+            key="pending_event_types",
             help="Death / Injury / Malfunction / Other — 비우면 전체",
         )
         form_date_range = st.date_input(
             "DATE_RECEIVED 범위",
-            value=(applied_from, applied_to),
+            value=(pending_from, pending_to),
+            key="pending_date_range",
             min_value=picker_min,
             max_value=picker_max,
             help="FDA 접수일 기준. 캘린더에서 두 날짜를 클릭해 범위 지정. "
@@ -2685,17 +3098,20 @@ with st.sidebar:
         )
         form_keyword = st.text_input(
             "키워드 검색",
-            value=applied_kw,
+            value=pending_kw,
+            key="pending_keyword",
             help="event_description / manufacturer_narrative / 요약 / patient·product problems / report_number / mdr_report_key 에서 부분일치 검색",
         )
         form_id_search = st.text_input(
             "Report Number / MDR Report Key 검색",
-            value=applied_id_search,
+            value=pending_id_search,
+            key="pending_id_search",
             help="쉼표/공백/줄바꿈으로 여러 값 입력 가능. 숫자형(예: 2954323-2024-14003, 19171008)은 자동으로 정확일치, 그 외는 부분일치로 검색합니다.",
         )
         form_code_search = st.text_input(
             "문제 코드 번호 검색",
-            value=applied_code_search,
+            value=pending_code_search,
+            key="pending_code_search",
             help="예: 3191 또는 3191, 2602. 기간/브랜드/EVENT_TYPE 필터와 함께 적용되며 "
                  "Health Effect - Clinical Code / Medical Device Problem Code 양쪽에서 매칭합니다.",
         )
@@ -2709,13 +3125,15 @@ with st.sidebar:
         form_report_stage_label = st.selectbox(
             "MDR 보고 구분",
             options=stage_labels,
-            index=stage_labels.index(inv_stage.get(applied_report_stage, "전체")),
+            index=stage_labels.index(inv_stage.get(pending_report_stage, "전체")),
+            key="pending_report_stage_label",
             help="초기 보고(Initial submission)와 후속 수정(Followup)을 분리해서 볼 수 있습니다.",
         )
         form_report_stage = report_stage_options[form_report_stage_label]
         form_max_rows = st.slider(
             "최대 표시 건수 (성능용 제한)",
-            min_value=100, max_value=50000, step=500, value=applied_max_rows,
+            min_value=100, max_value=max_rows_cap, step=500, value=pending_max_rows,
+            key="pending_max_rows",
             help="필터 결과가 많을 때 표시/다운로드할 최대 행. 다운로드 엑셀은 이 값까지.",
         )
         submitted = st.form_submit_button("🔍 필터 적용", type="primary", use_container_width=True)
@@ -2732,7 +3150,7 @@ with st.sidebar:
             d_from = d_to = form_date_range
         else:
             d_from, d_to = default_from, default_to
-        st.session_state.applied_filters = {
+        st.session_state.pending_filters = {
             "brands": form_brands,
             "categories": form_categories,
             "event_types": form_events,
@@ -2744,9 +3162,9 @@ with st.sidebar:
             "report_stage": _normalize_report_stage(form_report_stage),
             "max_rows": int(form_max_rows),
         }
+        st.session_state.applied_filters = st.session_state.pending_filters.copy()
         st.session_state.filter_applied = True
-        # Form submit 직후 즉시 rerun 해서 같은 run 에서 stale applied_filters 를
-        # 읽는 경로를 방지한다(필터가 두 번 눌려야 반영되는 현상 완화).
+        # Form submit 직후 즉시 rerun 해서 stale state 를 끊는다.
         st.rerun()
 
     if not st.session_state.get("filter_applied", False):
@@ -2841,18 +3259,28 @@ with st.sidebar:
 st.title("📊 FDA MAUDE CGM 부작용 대시보드")
 st.caption(
     "Dexcom / FreeStyle Libre 등 CGM 관련 부작용 보고를 필드별로 검색·집계합니다. "
-    "데이터는 `fda_maude_cgm.db` (FDA openFDA API 수집) 에서 실시간으로 읽습니다."
+    "데이터는 `fda_maude_cgm.db` (FDA openFDA API 수집) 에서 실시간으로 읽습니다. "
+    "주의: MAUDE 보고 건수는 실제 발생률이 아니라 보고 건수이며, 최근 월은 FDA 반영 지연과 중복 보고의 영향을 받을 수 있습니다."
 )
 
-filtered_total = query_filtered_count(
+COUNT_CARD_CAP = 20000
+filtered_has_match = query_has_match(
     mtime, sel_brands_query, sel_events, date_from, date_to, keyword
+)
+filtered_total_capped = query_filtered_count_capped(
+    mtime, sel_brands_query, sel_events, date_from, date_to, keyword, cap=COUNT_CARD_CAP
+)
+filtered_total_display = (
+    f"{COUNT_CARD_CAP:,}+"
+    if filtered_total_capped >= COUNT_CARD_CAP
+    else f"{filtered_total_capped:,}"
 )
 
 # 지표 카드
 with st.container():
     cols = st.columns(4)
     cols[0].metric("전체 DB 건수", f"{total_reports:,}")
-    cols[1].metric("필터 결과 건수", f"{filtered_total:,}")
+    cols[1].metric("필터 결과 건수", filtered_total_display)
     cols[2].metric("날짜 범위", f"{date_from} ~ {date_to}")
     cols[3].metric("선택 브랜드", f"{len(sel_brands) or '전체'}")
 
@@ -2865,7 +3293,7 @@ if _missing_new_cols:
         "유지되고 새로 받는 건만 인구통계가 포함됩니다)."
     )
 
-if filtered_total == 0:
+if not filtered_has_match:
     st.warning(
         "필터 결과가 0건입니다. 필터를 완화하거나 기간을 넓혀보세요. "
         "참고: 브랜드는 **부분 일치** 로 매칭됩니다 — 예) 'DEXCOM' 을 선택하면 "
@@ -2883,6 +3311,7 @@ if st.session_state.run_queries:
             "📋 전체 보고서",
             "⚠️ EVENT_TYPE 분포",
             "🏥 문제 코드",
+            "🔬 상세 월별 분석",
             "👤 환자 인구통계",
             "🏭 제조사 · 국가",
             "📈 월별 추이",
@@ -2956,7 +3385,7 @@ if st.session_state.run_queries:
                         )
 
             st.caption(
-                f"현재 설정: **최근 {window_days}일** · 심각도 비율 = "
+                f"현재 설정: **최근 {window_days}일** · 기준 날짜: `date_received` · 심각도 비율 = "
                 f"**{' + '.join(sev_num) or '∅'} / {' + '.join(sev_den) or '∅'}**"
             )
 
@@ -2967,9 +3396,12 @@ if st.session_state.run_queries:
                 "사망·중상 보고만 추려 **어떤 patient/device 문제가 실제 환자 피해로 이어졌는가**를 "
                 "분석합니다. 우리 제품 설계 리뷰에서 방어해야 할 실패 목록으로 활용."
             )
+            # 클릭-리렌더링 응답성을 위해 Death/Injury 원본 로드는 상한을 둔다.
+            # (max_rows를 DB 전체로 크게 올린 경우, 행 선택 때마다 재계산 체감 지연이 커짐)
+            severe_limit = min(max_rows, 5000)
             df_severe = query_severe_reports(
                 mtime, sel_brands_query, date_from, date_to, keyword,
-                severity_types=("Death", "Injury"), limit=max_rows,
+                severity_types=("Death", "Injury"), limit=severe_limit,
             )
             if df_severe.empty:
                 st.info("현재 필터 범위에 Death/Injury 보고가 없습니다.")
@@ -3508,10 +3940,30 @@ if st.session_state.run_queries:
 
         # ---------------- 탭 2: 전체 보고서
         if page == "📋 전체 보고서":
-            st.subheader(f"필터 결과 ({min(filtered_total, max_rows):,} / {filtered_total:,} 건 표시)")
+            # 상단 KPI는 capped 값이므로, 전체보고서 탭에서만 정확 건수를 별도 계산한다.
+            filtered_total = query_filtered_count(
+                mtime, sel_brands_query, sel_events, date_from, date_to, keyword
+            )
+            if "full_report_rows_loaded" not in st.session_state:
+                st.session_state.full_report_rows_loaded = 200
+            if "full_report_last_sig" not in st.session_state:
+                st.session_state.full_report_last_sig = None
+            current_sig = (
+                tuple(sel_brands_query),
+                tuple(sel_events),
+                str(date_from),
+                str(date_to),
+                keyword,
+            )
+            if st.session_state.full_report_last_sig != current_sig:
+                st.session_state.full_report_last_sig = current_sig
+                st.session_state.full_report_rows_loaded = 200
+            visible_limit = min(max_rows, st.session_state.full_report_rows_loaded)
+            st.subheader(f"필터 결과 ({min(visible_limit, filtered_total):,} / {filtered_total:,} 건 표시)")
+            st.caption("처음엔 200건만 보여주고, 아래의 '더 보기' 버튼으로 200건씩 추가 로드합니다.")
 
             df = query_reports(
-                mtime, sel_brands_query, sel_events, date_from, date_to, keyword, limit=max_rows
+                mtime, sel_brands_query, sel_events, date_from, date_to, keyword, limit=visible_limit
             )
 
             st.dataframe(
@@ -3520,6 +3972,14 @@ if st.session_state.run_queries:
                 height=600,
                 hide_index=True,
             )
+
+            if visible_limit < min(filtered_total, max_rows):
+                next_limit = min(visible_limit + 200, max_rows, filtered_total)
+                if st.button(f"더 보기 200건 ({next_limit:,}건까지)", key="full_report_load_more"):
+                    st.session_state.full_report_rows_loaded = next_limit
+                    st.rerun()
+            elif filtered_total > visible_limit:
+                st.caption("현재 표시 한도에 도달했습니다. 최대 표시 건수를 늘리면 더 많이 볼 수 있습니다.")
 
             # Excel 다운로드 버튼
             if len(df) > 0:
@@ -3571,15 +4031,7 @@ if st.session_state.run_queries:
                         f"**⚙️ {DEVICE_PROBLEM_LABEL} (Annex A):** {md_val or '(없음)'}"
                     )
 
-                    sections = query_report_narrative_sections(mtime, str(pick))
-                    with st.expander("EVENT_DESCRIPTION (원문)"):
-                        event_desc = sections.get("event_description") or row["EVENT_DESCRIPTION (원문)"]
-                        st.text(event_desc or "(없음)")
-                    with st.expander("MANUFACTURER_NARRATIVE (원문)"):
-                        mfr_narr = sections.get("manufacturer_narrative") or row["MANUFACTURER_NARRATIVE (원문)"]
-                        st.text(mfr_narr or "(없음)")
-                    with st.expander("ADDITIONAL_MANUFACTURER_NARRATIVE (원문)"):
-                        st.text(sections.get("additional_manufacturer_narrative") or "(없음)")
+                    _render_report_narratives(mtime, str(pick), row)
 
             # 코드별 보고서 탐색 (드릴다운) — Insight (b) 와 동일한 split-view 패턴
             if len(df) > 0:
@@ -3701,13 +4153,7 @@ if st.session_state.run_queries:
                                     f"**[요약] 결론:** "
                                     f"{d.get('[요약] 결론','') or '(없음)'}"
                                 )
-                                st.text_area(
-                                    label="event_description",
-                                    value=str(d.get("EVENT_DESCRIPTION (원문)", "") or "(없음)"),
-                                    height=180,
-                                    label_visibility="collapsed",
-                                    key=f"code_dd_{kind_key}_desc_{picked}",
-                                )
+                                _render_report_narratives(mtime, str(picked), d)
 
                 tab_he, tab_md = st.tabs([
                     f"🧑 {PATIENT_PROBLEM_LABEL}  (Annex E)",
@@ -3837,6 +4283,94 @@ if st.session_state.run_queries:
                         pivot.index.name = "BRAND_NAME"
                         st.dataframe(pivot, use_container_width=True)
 
+        # ---------------- 상세 월별 분석
+        if page == "🔬 상세 월별 분석":
+            st.subheader("상세 월별 분석")
+            st.caption(
+                "현재 필터 결과 중 선택한 EVENT_TYPE에 대해 월별 코드 구성을 비교합니다. "
+                "월별 건수 차이가 어떤 Health Effect / Medical Device Problem Code에서 비롯되는지 확인하는 화면입니다."
+            )
+            severe_options = [e for e in ["Death", "Injury"] if e in all_event_types]
+            if not severe_options:
+                severe_options = [e for e in all_event_types if e in sel_events] or all_event_types
+            detail_events = st.multiselect(
+                "분석할 EVENT_TYPE",
+                options=severe_options,
+                default=severe_options,
+                help="기본값은 Death와 Injury입니다. 현재 DB에 없는 EVENT_TYPE은 표시되지 않습니다.",
+            )
+            if not detail_events:
+                st.info("분석할 EVENT_TYPE을 하나 이상 선택하세요.")
+            else:
+                df_detail_codes = query_monthly_code_fields(
+                    mtime, sel_brands_query, detail_events, date_from, date_to, keyword
+                )
+                if df_detail_codes.empty:
+                    st.info("현재 필터와 EVENT_TYPE 조건에 해당하는 코드 데이터가 없습니다.")
+                else:
+                    monthly_counts = (
+                        df_detail_codes.groupby(["월", "event_type"], as_index=False)
+                        .size()
+                        .rename(columns={"size": "건수"})
+                    )
+                    count_pivot = monthly_counts.pivot_table(
+                        index="월", columns="event_type", values="건수", aggfunc="sum", fill_value=0
+                    ).sort_index()
+                    count_pivot["합계"] = count_pivot.sum(axis=1)
+                    st.markdown("##### 월별 Death/Injury 건수")
+                    st.bar_chart(count_pivot, use_container_width=True)
+                    with st.expander("월별 건수 원본 표", expanded=False):
+                        st.dataframe(count_pivot, use_container_width=True)
+
+                    top_health_by_month = _monthly_top_codes_table(
+                        df_detail_codes,
+                        "patient_problems",
+                        PATIENT_PROBLEM_LABEL,
+                        domain="patient",
+                        top_n=20,
+                    )
+                    top_device_by_month = _monthly_top_codes_table(
+                        df_detail_codes,
+                        "product_problems",
+                        DEVICE_PROBLEM_LABEL,
+                        domain="device",
+                        top_n=20,
+                    )
+                    tab_health, tab_device = st.tabs([
+                        f"월별 {PATIENT_PROBLEM_LABEL} Top 20",
+                        f"월별 {DEVICE_PROBLEM_LABEL} Top 20",
+                    ])
+                    with tab_health:
+                        if top_health_by_month.empty:
+                            st.info("Health Effect 코드 데이터가 없습니다.")
+                        else:
+                            st.dataframe(top_health_by_month, use_container_width=True, hide_index=True, height=520)
+                    with tab_device:
+                        if top_device_by_month.empty:
+                            st.info("Medical Device Problem Code 데이터가 없습니다.")
+                        else:
+                            st.dataframe(top_device_by_month, use_container_width=True, hide_index=True, height=520)
+
+                    st.markdown("##### Health Effect × Medical Device Problem Code 연결표")
+                    pair_df, pair_pivot = _health_device_pair_frames(df_detail_codes, top_n=20)
+                    if pair_pivot.empty or pair_df.empty:
+                        st.info("Health Effect와 Medical Device Problem Code를 함께 가진 보고서가 없습니다.")
+                    else:
+                        st.caption(
+                            "행은 상위 20개 Health Effect, 열은 전체 연결 건수 기준 상위 20개 Medical Device Problem Code입니다. "
+                            "각 셀은 같은 보고서 안에서 두 코드가 함께 나타난 건수입니다."
+                        )
+                        st.dataframe(pair_pivot, use_container_width=True, hide_index=True, height=620)
+                        with st.expander("연결 pair 원본 Top 목록", expanded=False):
+                            st.dataframe(pair_df.head(200), use_container_width=True, hide_index=True)
+
+                        st.markdown("##### Health Effect ↔ Device Problem 네트워크")
+                        st.caption("선 굵기는 두 코드가 같은 보고서에서 함께 나타난 빈도입니다. 너무 복잡하지 않도록 상위 연결만 표시합니다.")
+                        network_chart = _build_health_device_network_chart(pair_df, max_edges=60)
+                        if network_chart is None:
+                            st.info("네트워크 그래프를 만들 연결 데이터가 없습니다.")
+                        else:
+                            st.altair_chart(network_chart, use_container_width=True)
         # ---------------- 탭 5: 환자 인구통계
         if page == "👤 환자 인구통계":
             demo_cols = {"patient_sex", "patient_race", "patient_ethnicity", "patient_age"}
@@ -3947,8 +4481,27 @@ if st.session_state.run_queries:
         # ---------------- 탭 7: 월별 추이
         if page == "📈 월별 추이":
             st.subheader("월별 이벤트 유형 추이")
+            month_brand_candidates = sel_brands if sel_brands else display_brands
+            month_brand_options = ["전체(선택 브랜드 합계)"] + month_brand_candidates
+            default_month_brand = (
+                sel_brands[0] if len(sel_brands) == 1 else "전체(선택 브랜드 합계)"
+            )
+            month_brand_choice = st.selectbox(
+                "월별 추이 기준 브랜드",
+                options=month_brand_options,
+                index=month_brand_options.index(default_month_brand)
+                if default_month_brand in month_brand_options else 0,
+                help="브랜드를 하나 고르면 그 브랜드만, 전체를 고르면 현재 선택된 브랜드들의 합계로 봅니다.",
+            )
+            if month_brand_choice == "전체(선택 브랜드 합계)":
+                month_brands_query = sel_brands_query
+                month_title = "선택된 브랜드 합계"
+            else:
+                month_brands_query = [month_brand_choice]
+                month_title = month_brand_choice
+
             df_mon = query_group(
-                mtime, sel_brands_query, sel_events, date_from, date_to, keyword,
+                mtime, month_brands_query, sel_events, date_from, date_to, keyword,
                 """
                 SELECT substr(date_received,1,7) AS 월,
                        SUM(CASE WHEN event_type='Death'       THEN 1 ELSE 0 END) AS 사망,
@@ -3967,7 +4520,105 @@ if st.session_state.run_queries:
                 st.info("표시할 데이터가 없습니다.")
             else:
                 df_trend = df_mon.set_index("월")
-                st.line_chart(df_trend[["사망", "상해", "오작동", "기타"]])
-                st.bar_chart(df_trend[["합계"]])
+                st.caption(f"현재 보기: {month_title}")
+                for metric in ["사망", "상해", "기타"]:
+                    st.markdown(f"###### {metric} 월별 추이")
+                    single_df = df_trend.reset_index()[["월", metric]].copy()
+                    chart_single = _build_smoothed_line_chart(
+                        single_df,
+                        x_col="월",
+                        y_cols=[metric],
+                        title="건수",
+                    ).properties(height=320)
+                    st.altair_chart(chart_single, use_container_width=True)
+                st.markdown("###### 합계")
+                st.bar_chart(df_trend[["합계"]], use_container_width=True)
                 with st.expander("월별 원본 표"):
                     st.dataframe(df_trend, use_container_width=True)
+
+                compare_brands = sel_brands if sel_brands else display_brands
+                if compare_brands:
+                    st.markdown("##### 브랜드별 월별 비교")
+                    overlap_brands = st.multiselect(
+                        "겹쳐 볼 브랜드 선택",
+                        options=compare_brands,
+                        default=[],
+                        help="체크한 브랜드들만 한 그래프에 겹쳐서 비교합니다. 아무 것도 고르지 않으면 비교 그래프를 숨깁니다.",
+                    )
+                    compare_event_options = sel_events if sel_events else all_event_types
+                    overlap_events = st.multiselect(
+                        "비교할 EVENT_TYPE",
+                        options=compare_event_options,
+                        default=compare_event_options,
+                        help="브랜드별 월별 비교에 포함할 EVENT_TYPE입니다. 기본값은 현재 필터 범위의 전체 EVENT_TYPE입니다.",
+                    )
+
+                    if not overlap_brands:
+                        st.info("비교할 브랜드를 선택하세요. 기본값은 비어 있습니다.")
+                    elif not overlap_events:
+                        st.info("비교할 EVENT_TYPE을 하나 이상 선택하세요.")
+                    else:
+                        compare_brand_query: List[str] = []
+                        for chosen in overlap_brands:
+                            if chosen in CANONICAL_TO_MEMBERS:
+                                compare_brand_query.extend(CANONICAL_TO_MEMBERS[chosen])
+                            else:
+                                compare_brand_query.append(chosen)
+                        seen_compare: Set[str] = set()
+                        compare_brand_query = [b for b in compare_brand_query if not (b in seen_compare or seen_compare.add(b))]
+
+                        df_brand_mon = query_group(
+                            mtime, compare_brand_query, overlap_events, date_from, date_to, keyword,
+                            """
+                            SELECT substr(date_received,1,7) AS 월,
+                                   brand_name AS 브랜드,
+                                   COUNT(*) AS 건수
+                            FROM maude_reports
+                            WHERE {where} AND date_received IS NOT NULL AND date_received <> ''
+                            GROUP BY 1, 2
+                            ORDER BY 1, 2
+                            """,
+                            ["월", "브랜드", "건수"],
+                        )
+                        if df_brand_mon.empty:
+                            st.info("브랜드별 비교용 데이터가 없습니다.")
+                        else:
+                            if "브랜드" in df_brand_mon.columns:
+                                df_brand_mon["브랜드"] = df_brand_mon["브랜드"].apply(
+                                    lambda v: normalize_brand_value(v, MEMBER_TO_CANONICAL)
+                                )
+                            brand_totals = (
+                                df_brand_mon.groupby("브랜드", as_index=False)["건수"]
+                                .sum()
+                                .sort_values("건수", ascending=False)
+                            )
+                            selected_overlap = [
+                                str(normalize_brand_value(b, MEMBER_TO_CANONICAL))
+                                for b in overlap_brands
+                            ]
+                            selected_overlap = [b for b in selected_overlap if b in brand_totals["브랜드"].tolist()]
+                            if selected_overlap:
+                                df_brand_mon = df_brand_mon[df_brand_mon["브랜드"].isin(selected_overlap)]
+                            pivot_brand_mon = df_brand_mon.pivot_table(
+                                index="월",
+                                columns="브랜드",
+                                values="건수",
+                                aggfunc="sum",
+                                fill_value=0,
+                            )
+                            ordered_cols = brand_totals[brand_totals["브랜드"].isin(pivot_brand_mon.columns)]["브랜드"].tolist()
+                            pivot_brand_mon = pivot_brand_mon.reindex(columns=ordered_cols)
+                            st.caption(
+                                "겹쳐보기는 사용자가 고른 브랜드와 EVENT_TYPE 기준으로 표시됩니다. "
+                                f"EVENT_TYPE: {', '.join(overlap_events)}"
+                            )
+                            chart_brand = _build_smoothed_line_chart(
+                                pivot_brand_mon.reset_index(),
+                                x_col="월",
+                                y_cols=list(pivot_brand_mon.columns),
+                                title="건수",
+                            ).properties(height=320)
+                            st.altair_chart(chart_brand, use_container_width=True)
+                            st.bar_chart(pivot_brand_mon, use_container_width=True)
+                            with st.expander("브랜드별 월별 원본 표", expanded=False):
+                                st.dataframe(pivot_brand_mon, use_container_width=True)

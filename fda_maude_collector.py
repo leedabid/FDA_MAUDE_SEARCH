@@ -59,6 +59,49 @@ try:  # Python 3.7+
 except Exception:
     pass
 
+
+_ILLEGAL_XLSX_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
+
+
+def _sanitize_xlsx_value(value: Any) -> Any:
+    """openpyxl 이 거부하는 제어문자를 제거한다.
+
+    MAUDE 원문에는 보이지 않는 제어문자나 잘못된 문자가 섞일 수 있어
+    Excel 스트리밍 저장 시 IllegalCharacterError 를 일으킨다.
+    """
+    if isinstance(value, str) and value:
+        return _ILLEGAL_XLSX_CONTROL_CHARS.sub("", value)
+    return value
+
+
+def _sanitize_xlsx_row(
+    row: Iterable[Any],
+    *,
+    report_number: Optional[str] = None,
+    warn_limit: int = 20,
+    warned: Optional[Dict[str, int]] = None,
+) -> List[Any]:
+    """행 단위로 Excel 안전값으로 정리하고, 정리 사실을 제한적으로 로그한다."""
+    cleaned: List[Any] = []
+    changed = False
+    for idx, value in enumerate(row):
+        new_value = _sanitize_xlsx_value(value)
+        if new_value != value:
+            changed = True
+            if warned is not None and warned.get("count", 0) < warn_limit:
+                col_name = _EXCEL_MAIN_COLUMNS[idx][0] if idx < len(_EXCEL_MAIN_COLUMNS) else f"col_{idx+1}"
+                log.warning(
+                    "Excel 금지문자 정리: report_number=%s, column=%s",
+                    report_number or "(unknown)",
+                    col_name,
+                )
+                warned["count"] = warned.get("count", 0) + 1
+        cleaned.append(new_value)
+    if changed and warned is not None and warned.get("count", 0) == warn_limit:
+        warned["count"] = warn_limit + 1
+        log.warning("Excel 금지문자 정리 로그가 %d건을 넘어서 추가 로그를 생략합니다.", warn_limit)
+    return cleaned
+
 # ===========================================================================
 # ★ 사용자 설정 영역 — 여기만 고치면 검색 대상/출력 파일 이름 등을 바꿀 수 있음 ★
 # ===========================================================================
@@ -101,6 +144,8 @@ CGM_BRANDS: List[str] = SEARCH_MANUFACTURERS + SEARCH_BRANDS
 BRAND_CATEGORY_MAP: List[Tuple[str, str]] = [
     ("DEXCOM",          "CGM"),
     ("FREESTYLE LIBRE", "CGM"),
+    ("LIBRE",           "CGM"),
+    ("SENSEN",          "CGM"),
     ("MINIMED 780G",    "Insulin Pump"),
     ("OMNIPOD",         "Insulin Pump"),
     ("T:SLIM",          "Insulin Pump"),
@@ -264,6 +309,7 @@ CREATE TABLE IF NOT EXISTS maude_reports (
     product_problems       TEXT,                -- 제품 문제 (세미콜론 구분)
     event_description      TEXT,                -- 소비자/보고자 기술 내용 (원문)
     manufacturer_narrative TEXT,                -- 제조사 서술 (원문, 대응·조사결과)
+    additional_manufacturer_narrative TEXT,     -- 추가 제조사 서술 (원문, 후속 대응)
     summary_complaint_kr   TEXT,                -- 한글 요약: 소비자 불만사항
     summary_response_kr    TEXT,                -- 한글 요약: 제조사 대응
     summary_conclusion_kr  TEXT,                -- 한글 요약: 결론
@@ -293,11 +339,30 @@ CREATE INDEX IF NOT EXISTS idx_date_received   ON maude_reports(date_received);
 CREATE INDEX IF NOT EXISTS idx_product_code    ON maude_reports(product_code);
 CREATE INDEX IF NOT EXISTS idx_patient_sex     ON maude_reports(patient_sex);
 CREATE INDEX IF NOT EXISTS idx_type_of_report  ON maude_reports(type_of_report);
+CREATE INDEX IF NOT EXISTS idx_reports_date
+    ON maude_reports(date_received);
+CREATE INDEX IF NOT EXISTS idx_reports_event
+    ON maude_reports(event_type);
+CREATE INDEX IF NOT EXISTS idx_reports_category_date
+    ON maude_reports(device_category, date_received);
+CREATE INDEX IF NOT EXISTS idx_reports_brand_date
+    ON maude_reports(brand_name, date_received);
+CREATE INDEX IF NOT EXISTS idx_reports_mfr_date
+    ON maude_reports(manufacturer_name, date_received);
+CREATE INDEX IF NOT EXISTS idx_reports_product_code
+    ON maude_reports(product_code);
 """
 
 # 하위 호환: 예전 스크립트/테스트가 SCHEMA_SQL 을 임포트할 수도 있으므로 합본도 제공.
 # 주의: 이걸 그대로 executescript 로 돌리면 구 DB 에서 오류. init_db() 를 써야 함.
 SCHEMA_SQL = SCHEMA_TABLES_SQL + "\n" + SCHEMA_INDEXES_SQL
+
+
+LEGACY_FTS_TRIGGER_DROP_SQL = """
+DROP TRIGGER IF EXISTS maude_reports_ai;
+DROP TRIGGER IF EXISTS maude_reports_ad;
+DROP TRIGGER IF EXISTS maude_reports_au;
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +873,15 @@ def _manufacturer_country(dev: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _join_narrative_parts(parts: List[str]) -> Optional[str]:
+    cleaned = [str(p).strip() for p in parts if str(p or "").strip()]
+    if not cleaned:
+        return None
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return "\n\n".join(f"[{i}] {txt}" for i, txt in enumerate(cleaned, start=1))
+
+
 def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
     """openFDA MAUDE 이벤트 JSON 을 평탄화된 dict 로 변환."""
     devices = ev.get("device", []) or []
@@ -818,32 +892,31 @@ def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
 
     # 환자 인구통계 (첫 번째 환자 기준)
     pat0: Dict[str, Any] = patients[0] if patients else {}
-    # openFDA 에 따라 sex/ethnicity/race 는 patient 또는 이벤트 루트에 올 수 있음
     patient_sex = pat0.get("patient_sex") or ev.get("patient_sex")
     patient_ethnicity = pat0.get("patient_ethnicity") or ev.get("patient_ethnicity")
     patient_race = pat0.get("patient_race") or ev.get("patient_race")
 
     product_problems = _join_unique([ev.get("product_problems")])
 
-    # mdr_text: 보고자 기술과 제조사 내러티브
+    # mdr_text may contain repeated narrative blocks as the case is updated.
     event_desc_parts: List[str] = []
     mfr_narr_parts: List[str] = []
+    add_mfr_narr_parts: List[str] = []
     for t in ev.get("mdr_text", []) or []:
-        code = (t.get("text_type_code") or "").lower()
-        txt = (t.get("text") or "").strip()
+        if not isinstance(t, dict):
+            continue
+        code = str(t.get("text_type_code") or t.get("type") or "").lower()
+        txt = str(t.get("text") or t.get("text_value") or "").strip()
         if not txt:
             continue
-        if "manufacturer" in code:
+        if "additional" in code and "manufacturer" in code:
+            add_mfr_narr_parts.append(txt)
+        elif "manufacturer" in code:
             mfr_narr_parts.append(txt)
         else:
-            # "Description of Event or Problem" 등
             event_desc_parts.append(txt)
 
-    report_number = (
-        ev.get("report_number")
-        or ev.get("mdr_report_key")
-        or ""
-    )
+    report_number = ev.get("report_number") or ev.get("mdr_report_key") or ""
 
     return {
         "report_number": str(report_number),
@@ -872,8 +945,9 @@ def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         "patient_weight": _patient_weight(pat0),
         "patient_problems": patient_problems,
         "product_problems": product_problems,
-        "event_description": "\n\n".join(event_desc_parts) or None,
-        "manufacturer_narrative": "\n\n".join(mfr_narr_parts) or None,
+        "event_description": _join_narrative_parts(event_desc_parts),
+        "manufacturer_narrative": _join_narrative_parts(mfr_narr_parts),
+        "additional_manufacturer_narrative": _join_narrative_parts(add_mfr_narr_parts),
         "raw_json": json.dumps(ev, ensure_ascii=False),
     }
 
@@ -909,6 +983,7 @@ _TARGET_COLUMNS: List[Tuple[str, str]] = [
     ("product_problems",       "TEXT"),
     ("event_description",      "TEXT"),
     ("manufacturer_narrative", "TEXT"),
+    ("additional_manufacturer_narrative", "TEXT"),
     ("summary_complaint_kr",   "TEXT"),
     ("summary_response_kr",    "TEXT"),
     ("summary_conclusion_kr",  "TEXT"),
@@ -934,6 +1009,105 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _normalize_match_text(value: Optional[object]) -> str:
+    return str(value or "").strip().upper()
+
+
+def _is_cgm_brand_like(row: sqlite3.Row) -> bool:
+    fields = [row["brand_name"], row["generic_name"], row["manufacturer_name"], row["product_code"]]
+    combined = " | ".join(_normalize_match_text(v) for v in fields if _normalize_match_text(v))
+    if not combined:
+        return False
+    needles = ["DEXCOM", "FREESTYLE LIBRE", "FREE STYLE LIBRE", "LIBRE", "SENSEN"]
+    return any(needle in combined for needle in needles)
+
+
+def _log_null_category_remnants(conn: sqlite3.Connection, limit: int = 30) -> None:
+    rows = conn.execute(
+        """
+        SELECT COALESCE(NULLIF(brand_name,''), '미상') AS brand_name,
+               COALESCE(NULLIF(manufacturer_name,''), '미상') AS manufacturer_name,
+               COALESCE(NULLIF(product_code,''), '미상') AS product_code,
+               COUNT(*) AS cnt
+          FROM maude_reports
+         WHERE device_category IS NULL
+         GROUP BY 1, 2, 3
+         ORDER BY cnt DESC, brand_name, manufacturer_name, product_code
+         LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    if not rows:
+        log.info("남은 device_category NULL row 없음")
+        return
+    log.info("남은 device_category NULL row 상위 %d개:", limit)
+    for brand_name, manufacturer_name, product_code, cnt in rows:
+        log.info("  - brand=%s | manufacturer=%s | product_code=%s | count=%d", brand_name, manufacturer_name, product_code, cnt)
+
+
+def backfill_device_category(conn: sqlite3.Connection) -> None:
+    """과거 NULL device_category 를 CGM / Pump 으로 비파괴 백필한다."""
+    before_null = conn.execute(
+        "SELECT COUNT(*) FROM maude_reports WHERE device_category IS NULL"
+    ).fetchone()[0]
+    log.info("백필 전 device_category NULL count: %d", before_null)
+
+    params = [
+        "%DEXCOM%", "%DEXCOM%", "%DEXCOM%", "%DEXCOM%",
+        "%FREESTYLE LIBRE%", "%FREESTYLE LIBRE%", "%FREESTYLE LIBRE%", "%FREESTYLE LIBRE%",
+        "%FREE STYLE LIBRE%", "%FREE STYLE LIBRE%", "%FREE STYLE LIBRE%", "%FREE STYLE LIBRE%",
+        "%LIBRE%", "%LIBRE%", "%LIBRE%", "%LIBRE%",
+        "%SENSEN%", "%SENSEN%", "%SENSEN%", "%SENSEN%",
+    ]
+    conn.execute(
+        """
+        UPDATE maude_reports
+           SET device_category = 'CGM'
+         WHERE device_category IS NULL
+           AND (
+                UPPER(COALESCE(brand_name, '')) LIKE ?
+                OR UPPER(COALESCE(generic_name, '')) LIKE ?
+                OR UPPER(COALESCE(manufacturer_name, '')) LIKE ?
+                OR UPPER(COALESCE(product_code, '')) LIKE ?
+                OR UPPER(COALESCE(brand_name, '')) LIKE ?
+                OR UPPER(COALESCE(generic_name, '')) LIKE ?
+                OR UPPER(COALESCE(manufacturer_name, '')) LIKE ?
+                OR UPPER(COALESCE(product_code, '')) LIKE ?
+                OR UPPER(COALESCE(brand_name, '')) LIKE ?
+                OR UPPER(COALESCE(generic_name, '')) LIKE ?
+                OR UPPER(COALESCE(manufacturer_name, '')) LIKE ?
+                OR UPPER(COALESCE(product_code, '')) LIKE ?
+                OR UPPER(COALESCE(brand_name, '')) LIKE ?
+                OR UPPER(COALESCE(generic_name, '')) LIKE ?
+                OR UPPER(COALESCE(manufacturer_name, '')) LIKE ?
+                OR UPPER(COALESCE(product_code, '')) LIKE ?
+                OR UPPER(COALESCE(brand_name, '')) LIKE ?
+                OR UPPER(COALESCE(generic_name, '')) LIKE ?
+                OR UPPER(COALESCE(manufacturer_name, '')) LIKE ?
+                OR UPPER(COALESCE(product_code, '')) LIKE ?
+           )
+        """,
+        params,
+    )
+    conn.commit()
+    after_null = conn.execute(
+        "SELECT COUNT(*) FROM maude_reports WHERE device_category IS NULL"
+    ).fetchone()[0]
+    counts = conn.execute(
+        """
+        SELECT COALESCE(device_category, 'NULL') AS device_category, COUNT(*)
+          FROM maude_reports
+         GROUP BY COALESCE(device_category, 'NULL')
+         ORDER BY COUNT(*) DESC
+        """
+    ).fetchall()
+    log.info("백필 후 device_category 별 count:")
+    for category, cnt in counts:
+        log.info("  - %s: %d", category, cnt)
+    log.info("백필 후 device_category NULL count: %d", after_null)
+    _log_null_category_remnants(conn)
+
+
 def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     """DB 초기화.
 
@@ -946,13 +1120,25 @@ def init_db(path: Path = DB_PATH) -> sqlite3.Connection:
     구 DB 에서 `CREATE INDEX ... ON maude_reports(manufacturer_country)` 가
     ALTER 보다 먼저 실행돼 "no such column" 으로 전체가 실패했다.
     """
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA busy_timeout = 30000")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
     # 1) 테이블
     conn.executescript(SCHEMA_TABLES_SQL)
     # 2) 구 DB 마이그레이션 (신규 칼럼 추가)
     _migrate_schema(conn)
     # 3) 인덱스 (모든 칼럼 존재 보장됨)
     conn.executescript(SCHEMA_INDEXES_SQL)
+    # 4) Legacy FTS triggers are disabled: the dashboard uses SQL filters, not FTS.
+    # Keeping these triggers active duplicates large text/raw_json data and can create
+    # multi-GB rollback journals during startup sync.
+    conn.executescript(LEGACY_FTS_TRIGGER_DROP_SQL)
+    conn.commit()
+    backfill_device_category(conn)
+    conn.execute("PRAGMA optimize;")
     conn.commit()
     return conn
 
@@ -1047,12 +1233,18 @@ def upsert_report(conn: sqlite3.Connection, row: Dict[str, Any]) -> bool:
         return False
 
     # 한글 요약
+    manufacturer_text_for_summary = "\n\n".join(
+        p for p in [
+            row.get("manufacturer_narrative"),
+            row.get("additional_manufacturer_narrative"),
+        ] if p
+    ) or None
     complaint_kr, response_kr, conclusion_kr = summarize_korean(
         row.get("event_type"),
         row.get("patient_problems"),
         row.get("product_problems"),
         row.get("event_description"),
-        row.get("manufacturer_narrative"),
+        manufacturer_text_for_summary,
     )
 
     row["summary_complaint_kr"] = complaint_kr
@@ -1068,7 +1260,7 @@ def upsert_report(conn: sqlite3.Connection, row: Dict[str, Any]) -> bool:
         "type_of_report",
         "patient_age", "patient_sex", "patient_ethnicity", "patient_race", "patient_weight",
         "patient_problems", "product_problems",
-        "event_description", "manufacturer_narrative",
+        "event_description", "manufacturer_narrative", "additional_manufacturer_narrative",
         "summary_complaint_kr", "summary_response_kr", "summary_conclusion_kr",
         "raw_json", "collected_at",
     ]
@@ -1116,6 +1308,7 @@ _EXCEL_MAIN_COLUMNS: List[Tuple[str, str]] = [
     ("[요약] 결론", "summary_conclusion_kr"),
     ("EVENT_DESCRIPTION (원문)", "event_description"),
     ("MANUFACTURER_NARRATIVE (원문)", "manufacturer_narrative"),
+    ("ADDITIONAL_MANUFACTURER_NARRATIVE (원문)", "additional_manufacturer_narrative"),
     ("수집시각", "collected_at"),
 ]
 
@@ -1131,8 +1324,10 @@ def _stream_main_sheet(ws, conn: sqlite3.Connection) -> int:
         f"ORDER BY date_received DESC, report_number DESC"
     )
     rows = 0
+    warned: Dict[str, int] = {"count": 0}
     for row in cur:
-        ws.append(list(row))
+        report_number = row[0] if row else None
+        ws.append(_sanitize_xlsx_row(row, report_number=report_number, warned=warned))
         rows += 1
     return rows
 
@@ -1140,7 +1335,7 @@ def _stream_main_sheet(ws, conn: sqlite3.Connection) -> int:
 def _append_query_sheet(ws, conn: sqlite3.Connection, sql: str, headers: List[str]) -> None:
     ws.append(headers)
     for row in conn.execute(sql):
-        ws.append(list(row))
+        ws.append([_sanitize_xlsx_value(v) for v in row])
 
 
 def export_excel(conn: sqlite3.Connection, path: Path = EXCEL_PATH) -> None:
@@ -1245,7 +1440,7 @@ def export_excel(conn: sqlite3.Connection, path: Path = EXCEL_PATH) -> None:
         "PATIENT_ETHNICITY": 14, "PATIENT_RACE": 12, "PATIENT_WEIGHT": 12,
         "PATIENT_PROBLEMS": 30, "PRODUCT_PROBLEMS": 30,
         "[요약] 소비자 불만": 40, "[요약] 제조사 대응": 30, "[요약] 결론": 28,
-        "EVENT_DESCRIPTION (원문)": 50, "MANUFACTURER_NARRATIVE (원문)": 50,
+        "EVENT_DESCRIPTION (원문)": 50, "MANUFACTURER_NARRATIVE (원문)": 50, "ADDITIONAL_MANUFACTURER_NARRATIVE (원문)": 50,
         "수집시각": 18,
     }
     for idx, (label, _) in enumerate(_EXCEL_MAIN_COLUMNS, start=1):
@@ -1253,6 +1448,17 @@ def export_excel(conn: sqlite3.Connection, path: Path = EXCEL_PATH) -> None:
 
     wb.save(str(path))
     log.info("Excel 저장 완료: %s  (전체 보고서 %d건)", path, total_rows)
+
+
+def export_excel_only(db_path: Path, excel_path: Path) -> int:
+    """기존 DB를 열어 Excel만 다시 생성한다."""
+    conn = init_db(db_path)
+    try:
+        log.info("Excel 재생성 모드: DB=%s, Excel=%s", db_path, excel_path)
+        export_excel(conn, excel_path)
+    finally:
+        conn.close()
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -1365,13 +1571,14 @@ def main() -> int:
   python fda_maude_collector.py --test       # API 연결 진단
   python fda_maude_collector.py --initial    # 강제로 최초 모드 (2년 재수집)
   python fda_maude_collector.py --start 20240101 --end 20251130  # 기간 수동 지정
+  python fda_maude_collector.py --export-only # DB만으로 Excel 재생성
   python fda_maude_collector.py --verbose    # 상세 URL 로그
 """)
     parser.add_argument("--start", help="조회 시작일 YYYYMMDD (수동 지정, 체크포인트 갱신 안 함)")
     parser.add_argument("--end", help="조회 종료일 YYYYMMDD (수동 지정)")
     parser.add_argument("--initial", action="store_true",
                         help="강제 최초 모드: 체크포인트 무시하고 최근 2년 재수집")
-    parser.add_argument("--initial-years", type=int, default=2,
+    parser.add_argument("--initial-years", type=int, default=5,
                         help="최초 실행 시 과거 N년치 수집 (기본 2)")
     parser.add_argument("--overlap-days", type=int, default=1,
                         help="증분 시 이전 체크포인트와 겹칠 일수 (기본 1)")
@@ -1379,6 +1586,8 @@ def main() -> int:
                         help="openFDA API 키 (환경변수 OPENFDA_API_KEY 또는 api_key.txt 파일도 가능)")
     parser.add_argument("--db", default=str(DB_PATH), help="SQLite 경로")
     parser.add_argument("--excel", default=str(EXCEL_PATH), help="Excel 출력 경로")
+    parser.add_argument("--export-only", action="store_true",
+                        help="DB 수집 없이 현재 DB로 Excel만 재생성")
     parser.add_argument("--test", action="store_true",
                         help="진단 모드: API 연결 및 쿼리 검증만 수행 (DB 저장 안 함)")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -1400,6 +1609,9 @@ def main() -> int:
     # --test 모드: 진단만 하고 종료
     if args.test:
         return run_test_mode(api_key)
+
+    if args.export_only:
+        return export_excel_only(Path(args.db), Path(args.excel))
 
     db_path = Path(args.db)
     excel_path = Path(args.excel)

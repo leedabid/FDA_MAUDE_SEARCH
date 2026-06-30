@@ -40,8 +40,9 @@ store them in a local **SQLite database**, and explore them through an interacti
   (`Death` / `Injury` / `Other` with `adverse_event_flag = Y`), skipping the huge
   volume of routine `Malfunction` reports.
 - **SQLite storage** with `report_number` as primary key (automatic de-duplication).
+- Legacy `device_category IS NULL` CGM rows are backfilled to `CGM` during DB initialization so category statistics do not undercount Dexcom / Libre history.
 - **Streamlit dashboard** with:
-  - sidebar filters (brand, event type, date range, keyword, code search),
+  - sidebar filters (brand, event type, date range, keyword, code search) that apply on a single submit click,
   - brand-group management with an optional "hide already included brands" toggle,
   - an **Insights** tab (severity drill-down, escalation risk, manufacturer
     blind-spots, regulatory leading indicators, spike/new-code detection),
@@ -201,6 +202,7 @@ All user-tunable settings live at the top of
 | `EVENT_TYPES` | `["Death", "Injury", "Other"]` | Which MAUDE event types to collect. Add `"Malfunction"` to include routine device-malfunction reports (volume explodes). |
 | `ONLY_ADVERSE_EVENTS` | `True` | If `True`, only reports with `adverse_event_flag = Y` (actual patient harm). |
 | `USE_FALLBACK_FIELDS` | `True` | If a brand search returns 0 hits, also try `generic_name` / `manufacturer_d_name`. |
+| DB migration | automatic | Adds composite indexes on `date_received`, `event_type`, `device_category + date_received`, `brand_name + date_received`, and `manufacturer_name + date_received` for faster filtering. |
 
 Brand grouping/aliasing for the dashboard is configured in
 [brand_groups.json](brand_groups.json). Manual term→code overrides live in

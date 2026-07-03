@@ -2107,7 +2107,7 @@ def _build_smoothed_line_chart(
         color=alt.Color(
             "series:N",
             title="시리즈",
-            sort=y_cols,
+            scale=alt.Scale(domain=y_cols),
             legend=alt.Legend(orient=legend_orient) if legend_orient else alt.Legend(title="시리즈"),
         ),
         tooltip=[
@@ -2138,13 +2138,11 @@ def _legend_orient_from_label(label: str) -> Optional[str]:
     return mapping.get(str(label or "").strip(), "right")
 
 
-def _brand_legend_encoding(orient: Optional[str], *, title: str = "브랜드", sort: Optional[List[str]] = None) -> Optional[alt.Legend]:
+def _brand_legend_encoding(orient: Optional[str], *, title: str = "브랜드") -> Optional[alt.Legend]:
     """브랜드 범례 설정을 일관되게 만든다."""
     if orient is None:
         return None
     kwargs = {"title": title, "orient": orient}
-    if sort:
-        kwargs["sort"] = sort
     return alt.Legend(**kwargs)
 
 
@@ -2164,8 +2162,8 @@ def _brand_month_line_chart(
     plot["건수"] = pd.to_numeric(plot["건수"], errors="coerce").fillna(0)
     plot["브랜드"] = plot["브랜드"].astype(str)
 
-    legend = _brand_legend_encoding(legend_orient, title="브랜드", sort=brand_order)
-    color = alt.Color("브랜드:N", sort=brand_order, legend=legend)
+    legend = _brand_legend_encoding(legend_orient, title="브랜드")
+    color = alt.Color("브랜드:N", scale=alt.Scale(domain=brand_order), legend=legend)
     x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
 
     line = alt.Chart(plot).mark_line(point=True).encode(
@@ -2207,8 +2205,8 @@ def _brand_month_bar_chart(
     plot["건수"] = pd.to_numeric(plot["건수"], errors="coerce").fillna(0)
     plot["브랜드"] = plot["브랜드"].astype(str)
 
-    legend = _brand_legend_encoding(legend_orient, title="브랜드", sort=brand_order)
-    color = alt.Color("브랜드:N", sort=brand_order, legend=legend)
+    legend = _brand_legend_encoding(legend_orient, title="브랜드")
+    color = alt.Color("브랜드:N", scale=alt.Scale(domain=brand_order), legend=legend)
     x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
 
     chart = alt.Chart(plot).mark_bar().encode(
@@ -2241,8 +2239,8 @@ def _brand_month_share_chart(
     plot["건수"] = pd.to_numeric(plot["건수"], errors="coerce").fillna(0)
     plot["브랜드"] = plot["브랜드"].astype(str)
 
-    legend = _brand_legend_encoding(legend_orient, title="브랜드", sort=brand_order)
-    color = alt.Color("브랜드:N", sort=brand_order, legend=legend)
+    legend = _brand_legend_encoding(legend_orient, title="브랜드")
+    color = alt.Color("브랜드:N", scale=alt.Scale(domain=brand_order), legend=legend)
     x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
 
     chart = (

@@ -7,6 +7,15 @@ Newest entries first.
 
 ## 2026-07-03
 
+### [Fix] Monthly trend brand comparison legend order/color now use scale domain
+
+- Replaced the invalid `Legend.sort` approach with color scale domains so the
+  three brand-comparison charts share the same legend order and color mapping.
+
+---
+
+## 2026-07-03
+
 ### [Fix] Monthly trend brand comparison legend order unified
 
 - Aligned the legend order across the three brand-comparison charts in Monthly

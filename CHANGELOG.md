@@ -7,6 +7,16 @@ Newest entries first.
 
 ## 2026-07-03
 
+### [Fix] Monthly trend brand comparison legend order unified
+
+- Aligned the legend order across the three brand-comparison charts in Monthly
+  trend by using the same brand order for the line, grouped bar, and 100%
+  share views.
+
+---
+
+## 2026-07-03
+
 ### [Fix] Monthly trend smoothing now matches raw-series color
 
 - Updated the smoothed line overlays in Monthly trend so they reuse the same

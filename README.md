@@ -396,6 +396,7 @@ right under the EVENT_TYPE selector, so the line chart, grouped bar chart, and t
 new 100% stacked share chart all stay visually aligned.
 The smoothed lines in Monthly trend use the same color as the raw series, and the
 smoothed overlays do not add separate legend entries.
+Those three charts also share the same brand order in the legend.
 
 ---
 

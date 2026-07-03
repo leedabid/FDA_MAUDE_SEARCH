@@ -50,6 +50,8 @@ store them in a local **SQLite database**, and explore them through an interacti
   - problem-code analytics with **FDA Annex code numbers** attached to each term,
   - one-click Excel export (insight report or full dashboard dump with native charts).
 
+> **Current status (2026-07-03):** the collector + dashboard pipeline is already usable end-to-end for the current CGM-focused workflow. The Python code handles checkpoint-based incremental collection, SQLite storage, Korean summaries, and dashboard exploration. For a true "every morning at 9" run, keep using an external scheduler (for example Windows Task Scheduler) to launch `run_collector.bat`; the repo intentionally keeps scheduling outside the Python collector.
+
 ---
 
 ## 2. How it works
@@ -329,6 +331,21 @@ run_collector.bat test       API diagnostics only
 test_api.bat                 same as `--test`
 diagnose.bat                 print Python/PATH info (for troubleshooting)
 ```
+
+### 7.1 Daily 9:00 automation
+
+The collector is already safe to run once per day because it uses a checkpoint and a
+1-day overlap. To automate the morning run, register `run_collector.bat` in your OS
+scheduler and trigger it daily at `09:00`.
+
+Suggested setup:
+
+1. Trigger: daily at 09:00
+2. Action: run `run_collector.bat` from the repository root
+3. Output: keep the generated SQLite DB and Excel file local only
+
+If you later want the schedule managed inside Python, that can be added as a
+separate layer, but it is not required for the current workflow.
 
 ### Checkpoint logic
 

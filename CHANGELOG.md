@@ -5,6 +5,21 @@ Newest entries first.
 
 ---
 
+## 2026-07-03
+
+### [Docs] Current-state snapshot + daily-run guidance
+
+- Documented the current end-to-end workflow in `README.md`: checkpoint-based
+  incremental collection, SQLite storage, Korean summaries, and dashboard
+  exploration are already in place.
+- Added a short operational note that daily `09:00` execution should be wired
+  through an external scheduler such as Windows Task Scheduler, using
+  `run_collector.bat` as the launch target.
+- Kept the repository's dual-scope collector intent intact while clarifying the
+  current CGM-focused day-to-day usage.
+
+---
+
 ## 2026-06-29
 
 ### [Fix] Filter submit now applies on the first click

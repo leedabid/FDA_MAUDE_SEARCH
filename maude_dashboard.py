@@ -2105,6 +2105,153 @@ def _build_smoothed_line_chart(df: pd.DataFrame, *, x_col: str, y_cols: List[str
     return raw_line + smooth_line
 
 
+def _legend_orient_from_label(label: str) -> Optional[str]:
+    """UI 라벨을 Altair legend orient 값으로 변환."""
+    mapping = {
+        "오른쪽": "right",
+        "왼쪽": "left",
+        "위": "top",
+        "아래": "bottom",
+        "숨김": None,
+    }
+    return mapping.get(str(label or "").strip(), "right")
+
+
+def _brand_legend_encoding(orient: Optional[str], *, title: str = "브랜드", sort: Optional[List[str]] = None) -> Optional[alt.Legend]:
+    """브랜드 범례 설정을 일관되게 만든다."""
+    if orient is None:
+        return None
+    kwargs = {"title": title, "orient": orient}
+    return alt.Legend(**kwargs)
+
+
+def _brand_month_line_chart(
+    df: pd.DataFrame,
+    *,
+    legend_orient: Optional[str],
+    brand_order: List[str],
+    height: int = 320,
+) -> alt.Chart:
+    """브랜드별 월별 추이 선 그래프."""
+    if df is None or df.empty:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_line()
+
+    plot = df.copy()
+    plot["월"] = plot["월"].astype(str)
+    plot["건수"] = pd.to_numeric(plot["건수"], errors="coerce").fillna(0)
+    plot["브랜드"] = plot["브랜드"].astype(str)
+
+    legend = _brand_legend_encoding(legend_orient, title="브랜드")
+    color = alt.Color("브랜드:N", sort=brand_order, legend=legend)
+    x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
+
+    line = alt.Chart(plot).mark_line(point=True).encode(
+        x=x_field,
+        y=alt.Y("건수:Q", title="건수"),
+        color=color,
+        tooltip=[
+            alt.Tooltip("월:O", title="월"),
+            alt.Tooltip("브랜드:N", title="브랜드"),
+            alt.Tooltip("건수:Q", title="건수", format=".0f"),
+        ],
+    )
+    points = alt.Chart(plot).mark_circle(size=60).encode(
+        x=x_field,
+        y=alt.Y("건수:Q", title="건수"),
+        color=color,
+        tooltip=[
+            alt.Tooltip("월:O", title="월"),
+            alt.Tooltip("브랜드:N", title="브랜드"),
+            alt.Tooltip("건수:Q", title="건수", format=".0f"),
+        ],
+    )
+    return (line + points).properties(height=height).configure_view(stroke=None)
+
+
+def _brand_month_bar_chart(
+    df: pd.DataFrame,
+    *,
+    legend_orient: Optional[str],
+    brand_order: List[str],
+    height: int = 320,
+) -> alt.Chart:
+    """브랜드별 월별 비교 막대 그래프(월별 grouped bar)."""
+    if df is None or df.empty:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_bar()
+
+    plot = df.copy()
+    plot["월"] = plot["월"].astype(str)
+    plot["건수"] = pd.to_numeric(plot["건수"], errors="coerce").fillna(0)
+    plot["브랜드"] = plot["브랜드"].astype(str)
+
+    legend = _brand_legend_encoding(legend_orient, title="브랜드")
+    color = alt.Color("브랜드:N", sort=brand_order, legend=legend)
+    x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
+
+    chart = alt.Chart(plot).mark_bar().encode(
+        x=x_field,
+        xOffset=alt.XOffset("브랜드:N", sort=brand_order),
+        y=alt.Y("건수:Q", title="건수"),
+        color=color,
+        tooltip=[
+            alt.Tooltip("월:O", title="월"),
+            alt.Tooltip("브랜드:N", title="브랜드"),
+            alt.Tooltip("건수:Q", title="건수", format=".0f"),
+        ],
+    )
+    return chart.properties(height=height).configure_view(stroke=None)
+
+
+def _brand_month_share_chart(
+    df: pd.DataFrame,
+    *,
+    legend_orient: Optional[str],
+    brand_order: List[str],
+    height: int = 320,
+) -> alt.Chart:
+    """월별 총합을 100%로 정규화한 브랜드 비중 차트."""
+    if df is None or df.empty:
+        return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_bar()
+
+    plot = df.copy()
+    plot["월"] = plot["월"].astype(str)
+    plot["건수"] = pd.to_numeric(plot["건수"], errors="coerce").fillna(0)
+    plot["브랜드"] = plot["브랜드"].astype(str)
+
+    legend = _brand_legend_encoding(legend_orient, title="브랜드")
+    color = alt.Color("브랜드:N", sort=brand_order, legend=legend)
+    x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
+
+    chart = (
+        alt.Chart(plot)
+        .transform_joinaggregate(
+            month_total="sum(건수)",
+            groupby=["월"],
+        )
+        .transform_calculate(
+            비중='datum.month_total > 0 ? datum["건수"] / datum.month_total : 0'
+        )
+        .mark_bar()
+        .encode(
+            x=x_field,
+            y=alt.Y(
+                "건수:Q",
+                stack="normalize",
+                title="비중",
+                axis=alt.Axis(format=".0%"),
+            ),
+            color=color,
+            tooltip=[
+                alt.Tooltip("월:O", title="월"),
+                alt.Tooltip("브랜드:N", title="브랜드"),
+                alt.Tooltip("건수:Q", title="건수", format=".0f"),
+                alt.Tooltip("비중:Q", title="비중", format=".1%"),
+            ],
+        )
+    )
+    return chart.properties(height=height).configure_view(stroke=None)
+
+
 # ---------------------------------------------------------------------------
 # Excel 다운로드
 # ---------------------------------------------------------------------------
@@ -4552,6 +4699,13 @@ if st.session_state.run_queries:
                         default=compare_event_options,
                         help="브랜드별 월별 비교에 포함할 EVENT_TYPE입니다. 기본값은 현재 필터 범위의 전체 EVENT_TYPE입니다.",
                     )
+                    legend_orient_label = st.selectbox(
+                        "범례 위치",
+                        options=["오른쪽", "아래", "위", "왼쪽", "숨김"],
+                        index=0,
+                        help="선 그래프, 막대 그래프, 100% 비중 그래프의 범례 위치를 함께 바꿉니다.",
+                    )
+                    legend_orient = _legend_orient_from_label(legend_orient_label)
 
                     if not overlap_brands:
                         st.info("비교할 브랜드를 선택하세요. 기본값은 비어 있습니다.")
@@ -4599,26 +4753,43 @@ if st.session_state.run_queries:
                             selected_overlap = [b for b in selected_overlap if b in brand_totals["브랜드"].tolist()]
                             if selected_overlap:
                                 df_brand_mon = df_brand_mon[df_brand_mon["브랜드"].isin(selected_overlap)]
-                            pivot_brand_mon = df_brand_mon.pivot_table(
-                                index="월",
-                                columns="브랜드",
-                                values="건수",
-                                aggfunc="sum",
-                                fill_value=0,
-                            )
-                            ordered_cols = brand_totals[brand_totals["브랜드"].isin(pivot_brand_mon.columns)]["브랜드"].tolist()
-                            pivot_brand_mon = pivot_brand_mon.reindex(columns=ordered_cols)
-                            st.caption(
-                                "겹쳐보기는 사용자가 고른 브랜드와 EVENT_TYPE 기준으로 표시됩니다. "
-                                f"EVENT_TYPE: {', '.join(overlap_events)}"
-                            )
-                            chart_brand = _build_smoothed_line_chart(
-                                pivot_brand_mon.reset_index(),
-                                x_col="월",
-                                y_cols=list(pivot_brand_mon.columns),
-                                title="건수",
-                            ).properties(height=320)
-                            st.altair_chart(chart_brand, use_container_width=True)
-                            st.bar_chart(pivot_brand_mon, use_container_width=True)
-                            with st.expander("브랜드별 월별 원본 표", expanded=False):
-                                st.dataframe(pivot_brand_mon, use_container_width=True)
+                            if df_brand_mon.empty:
+                                st.info("선택한 브랜드 조합에서 표시할 데이터가 없습니다.")
+                            else:
+                                brand_order = brand_totals[brand_totals["브랜드"].isin(df_brand_mon["브랜드"].unique())]["브랜드"].tolist()
+                                pivot_brand_mon = df_brand_mon.pivot_table(
+                                    index="월",
+                                    columns="브랜드",
+                                    values="건수",
+                                    aggfunc="sum",
+                                    fill_value=0,
+                                )
+                                pivot_brand_mon = pivot_brand_mon.reindex(columns=brand_order)
+                                chart_df = df_brand_mon[["월", "브랜드", "건수"]].copy()
+                                chart_df["월"] = chart_df["월"].astype(str)
+                                chart_df["브랜드"] = chart_df["브랜드"].astype(str)
+                                st.caption(
+                                    "겹쳐보기는 사용자가 고른 브랜드와 EVENT_TYPE 기준으로 표시됩니다. "
+                                    f"EVENT_TYPE: {', '.join(overlap_events)}"
+                                )
+                                chart_brand = _brand_month_line_chart(
+                                    chart_df,
+                                    legend_orient=legend_orient,
+                                    brand_order=brand_order,
+                                )
+                                chart_bar = _brand_month_bar_chart(
+                                    chart_df,
+                                    legend_orient=legend_orient,
+                                    brand_order=brand_order,
+                                )
+                                chart_share = _brand_month_share_chart(
+                                    chart_df,
+                                    legend_orient=legend_orient,
+                                    brand_order=brand_order,
+                                )
+                                st.altair_chart(chart_brand, use_container_width=True)
+                                st.altair_chart(chart_bar, use_container_width=True)
+                                st.markdown("###### 월별 100% 누적 비중")
+                                st.altair_chart(chart_share, use_container_width=True)
+                                with st.expander("브랜드별 월별 원본 표", expanded=False):
+                                    st.dataframe(pivot_brand_mon, use_container_width=True)

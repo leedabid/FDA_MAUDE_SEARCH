@@ -7,6 +7,19 @@ Newest entries first.
 
 ## 2026-07-03
 
+### [Dashboard] Monthly brand comparison legend control + 100% share chart
+
+- Moved the brand-comparison legend placement control into the Monthly trend
+  section, directly under the EVENT_TYPE selector.
+- Switched the comparison visuals to Altair so the line chart and grouped bar
+  chart now share the same legend position setting.
+- Added a new month-by-month 100% stacked share chart so each month shows the
+  brand composition as percentages.
+
+---
+
+## 2026-07-03
+
 ### [Docs] Current-state snapshot + daily-run guidance
 
 - Documented the current end-to-end workflow in `README.md`: checkpoint-based

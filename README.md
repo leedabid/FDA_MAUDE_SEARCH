@@ -48,7 +48,8 @@ store them in a local **SQLite database**, and explore them through an interacti
     blind-spots, regulatory leading indicators, spike/new-code detection),
   - a **Full reports** tab with per-report detail and **per-code drill-down**,
   - problem-code analytics with **FDA Annex code numbers** attached to each term,
-  - one-click Excel export (insight report or full dashboard dump with native charts).
+  - one-click Excel export (insight report or full dashboard dump with native charts),
+  - month-by-month brand comparison with a user-controlled legend position and a 100% share bar chart.
 
 > **Current status (2026-07-03):** the collector + dashboard pipeline is already usable end-to-end for the current CGM-focused workflow. The Python code handles checkpoint-based incremental collection, SQLite storage, Korean summaries, and dashboard exploration. For a true "every morning at 9" run, keep using an external scheduler (for example Windows Task Scheduler) to launch `run_collector.bat`; the repo intentionally keeps scheduling outside the Python collector.
 
@@ -389,6 +390,10 @@ same time — press **F5** in the browser to pick up new data.
 5. **Patient demographics** — sex / race / ethnicity / age.
 6. **Manufacturer & country** — top manufacturers, countries, product codes.
 7. **Monthly trend** — line/bar charts by event type.
+
+The "brand comparison" section in Monthly trend lets you choose the legend position
+right under the EVENT_TYPE selector, so the line chart, grouped bar chart, and the
+new 100% stacked share chart all stay visually aligned.
 
 ---
 

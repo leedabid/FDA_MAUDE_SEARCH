@@ -2067,7 +2067,14 @@ def linked_line_and_table(
     st.altair_chart(chart, use_container_width=True, key=f"altair_linked_{key}" if key else None)
 
 
-def _build_smoothed_line_chart(df: pd.DataFrame, *, x_col: str, y_cols: List[str], title: str) -> alt.Chart:
+def _build_smoothed_line_chart(
+    df: pd.DataFrame,
+    *,
+    x_col: str,
+    y_cols: List[str],
+    title: str,
+    legend_orient: Optional[str] = None,
+) -> alt.Chart:
     """원시 선과 이동평균 스무딩 선을 함께 보여주는 Altair 차트."""
     if df is None or df.empty or x_col not in df.columns or not y_cols:
         return alt.Chart(pd.DataFrame({"x": [], "y": []})).mark_line()
@@ -2097,7 +2104,7 @@ def _build_smoothed_line_chart(df: pd.DataFrame, *, x_col: str, y_cols: List[str
     base = alt.Chart(chart_df).encode(
         x=alt.X(f"{x_col}:O", title="월"),
         y=alt.Y("value:Q", title=title),
-        color=alt.Color("series:N", title="시리즈"),
+        color=alt.Color("series:N", title="시리즈", legend=alt.Legend(orient=legend_orient) if legend_orient else alt.Legend(title="시리즈")),
         tooltip=[alt.Tooltip(f"{x_col}:O", title="월"), alt.Tooltip("series:N", title="시리즈"), alt.Tooltip("value:Q", title="값")],
     )
     raw_line = base.transform_filter(alt.datum.kind == "raw").mark_line(point=True)
@@ -4772,11 +4779,13 @@ if st.session_state.run_queries:
                                     "겹쳐보기는 사용자가 고른 브랜드와 EVENT_TYPE 기준으로 표시됩니다. "
                                     f"EVENT_TYPE: {', '.join(overlap_events)}"
                                 )
-                                chart_brand = _brand_month_line_chart(
-                                    chart_df,
+                                chart_brand = _build_smoothed_line_chart(
+                                    pivot_brand_mon.reset_index(),
+                                    x_col="월",
+                                    y_cols=list(pivot_brand_mon.columns),
+                                    title="건수",
                                     legend_orient=legend_orient,
-                                    brand_order=brand_order,
-                                )
+                                ).properties(height=320)
                                 chart_bar = _brand_month_bar_chart(
                                     chart_df,
                                     legend_orient=legend_orient,

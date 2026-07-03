@@ -7,6 +7,16 @@ Newest entries first.
 
 ## 2026-07-03
 
+### [Fix] Restore Monthly trend brand-comparison line chart
+
+- Reverted the brand-comparison line chart in Monthly trend back to the
+  original smoothed line presentation.
+- Kept the new legend-position selector and the added 100% share chart.
+
+---
+
+## 2026-07-03
+
 ### [Dashboard] Monthly brand comparison legend control + 100% share chart
 
 - Moved the brand-comparison legend placement control into the Monthly trend

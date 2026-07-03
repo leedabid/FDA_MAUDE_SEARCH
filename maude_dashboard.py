@@ -2093,10 +2093,10 @@ def _build_smoothed_line_chart(
         tmp["smoothed"] = tmp[col].rolling(window=3, center=True, min_periods=1).mean()
         tmp = tmp.rename(columns={col: "raw"})
         raw_df = tmp[[x_col, "raw"]].rename(columns={"raw": "value"})
-        raw_df["series"] = f"{col} (원본)"
+        raw_df["series"] = col
         raw_df["kind"] = "raw"
         smooth_df = tmp[[x_col, "smoothed"]].rename(columns={"smoothed": "value"})
-        smooth_df["series"] = f"{col} (스무딩)"
+        smooth_df["series"] = col
         smooth_df["kind"] = "smooth"
         smoothed_frames.extend([raw_df, smooth_df])
 
@@ -2104,11 +2104,24 @@ def _build_smoothed_line_chart(
     base = alt.Chart(chart_df).encode(
         x=alt.X(f"{x_col}:O", title="월"),
         y=alt.Y("value:Q", title=title),
-        color=alt.Color("series:N", title="시리즈", legend=alt.Legend(orient=legend_orient) if legend_orient else alt.Legend(title="시리즈")),
-        tooltip=[alt.Tooltip(f"{x_col}:O", title="월"), alt.Tooltip("series:N", title="시리즈"), alt.Tooltip("value:Q", title="값")],
+        color=alt.Color(
+            "series:N",
+            title="시리즈",
+            legend=alt.Legend(orient=legend_orient) if legend_orient else alt.Legend(title="시리즈"),
+        ),
+        tooltip=[
+            alt.Tooltip(f"{x_col}:O", title="월"),
+            alt.Tooltip("series:N", title="시리즈"),
+            alt.Tooltip("kind:N", title="종류"),
+            alt.Tooltip("value:Q", title="값"),
+        ],
     )
     raw_line = base.transform_filter(alt.datum.kind == "raw").mark_line(point=True)
-    smooth_line = base.transform_filter(alt.datum.kind == "smooth").mark_line(strokeDash=[6, 4], strokeWidth=3)
+    smooth_line = base.transform_filter(alt.datum.kind == "smooth").mark_line(
+        strokeDash=[6, 4],
+        strokeWidth=3,
+        opacity=0.9,
+    )
     return raw_line + smooth_line
 
 

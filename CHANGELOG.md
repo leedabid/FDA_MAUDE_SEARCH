@@ -7,6 +7,16 @@ Newest entries first.
 
 ## 2026-07-03
 
+### [Fix] Monthly trend smoothing now matches raw-series color
+
+- Updated the smoothed line overlays in Monthly trend so they reuse the same
+  color as the raw series.
+- Kept the smoothed overlays out of the legend to avoid duplicate entries.
+
+---
+
+## 2026-07-03
+
 ### [Fix] Restore Monthly trend brand-comparison line chart
 
 - Reverted the brand-comparison line chart in Monthly trend back to the

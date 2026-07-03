@@ -394,6 +394,8 @@ same time — press **F5** in the browser to pick up new data.
 The "brand comparison" section in Monthly trend lets you choose the legend position
 right under the EVENT_TYPE selector, so the line chart, grouped bar chart, and the
 new 100% stacked share chart all stay visually aligned.
+The smoothed lines in Monthly trend use the same color as the raw series, and the
+smoothed overlays do not add separate legend entries.
 
 ---
 

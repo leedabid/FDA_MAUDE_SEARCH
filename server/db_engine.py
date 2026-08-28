@@ -412,8 +412,12 @@ def query_reports(
         data_sql = f"""
             SELECT r.report_number, r.mdr_report_key, r.event_type, r.date_received, r.date_of_event,
                    r.brand_name, r.device_category, r.manufacturer_name, r.patient_problems, r.product_problems,
-                   r.summary_complaint_kr, r.summary_response_kr, r.summary_conclusion_kr
+                   r.summary_complaint_kr, r.summary_response_kr, r.summary_conclusion_kr,
+                   ((t.event_description IS NOT NULL AND length(t.event_description) > 5) OR
+                    (t.manufacturer_narrative IS NOT NULL AND length(t.manufacturer_narrative) > 5) OR
+                    (t.additional_manufacturer_narrative IS NOT NULL AND length(t.additional_manufacturer_narrative) > 5)) AS has_real_narrative
             FROM {from_sql}
+            LEFT JOIN maude_reports_text t ON t.report_number = r.report_number
             WHERE {where_sql}
             ORDER BY {order_col} {order_dir}
             LIMIT ? OFFSET ?
@@ -422,17 +426,15 @@ def query_reports(
         rows = []
         for r in cursor.fetchall():
             row_dict = dict(r)
-            has_narr = bool(
-                (row_dict.get("summary_response_kr") and "대응" in str(row_dict["summary_response_kr"]) and len(str(row_dict["summary_response_kr"]).strip()) > 10) or
-                (row_dict.get("summary_conclusion_kr") and "결론" in str(row_dict["summary_conclusion_kr"]) and len(str(row_dict["summary_conclusion_kr"]).strip()) > 10)
-            )
-            has_codes = bool(
-                (row_dict.get("patient_problems") and len(str(row_dict["patient_problems"]).strip()) > 2) or
-                (row_dict.get("product_problems") and len(str(row_dict["product_problems"]).strip()) > 2) or
-                (row_dict.get("summary_complaint_kr") and len(str(row_dict["summary_complaint_kr"]).strip()) > 2)
-            )
+            has_narr = bool(row_dict.get("has_real_narrative"))
             
-            # Determine content type: narrative (full text) vs codes (structured only) vs none
+            p_prob = str(row_dict.get("patient_problems") or "").strip()
+            d_prob = str(row_dict.get("product_problems") or "").strip()
+            
+            has_valid_patient_code = bool(p_prob and p_prob != "None" and p_prob != "No Information" and p_prob != "No Clinical Signs, Symptoms or Conditions")
+            has_valid_product_code = bool(d_prob and d_prob != "None" and d_prob != "No Information" and len(d_prob) > 2)
+            has_codes = has_valid_patient_code or has_valid_product_code
+
             if has_narr:
                 content_status = "narrative"
             elif has_codes:

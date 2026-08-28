@@ -138,4 +138,30 @@ export const getInsights = async (filters: FilterState): Promise<InsightsData> =
   return res.data;
 };
 
+export interface SyncStatusResponse {
+  is_running: boolean;
+  current_step: string;
+  total_target: number;
+  processed_count: number;
+  inserted_count: number;
+  start_time: number | null;
+  error: string | null;
+  logs: string[];
+}
+
+export const getSyncStatus = async (): Promise<SyncStatusResponse> => {
+  const res = await api.get<SyncStatusResponse>("/sync/status");
+  return res.data;
+};
+
+export const startSync = async (payload: {
+  mode: "incremental" | "custom";
+  date_from?: string;
+  date_to?: string;
+  categories?: string[];
+}): Promise<{ status: string; message: string }> => {
+  const res = await api.post<{ status: string; message: string }>("/sync/start", payload);
+  return res.data;
+};
+
 export default api;

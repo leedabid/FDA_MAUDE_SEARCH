@@ -8,6 +8,7 @@ import { ProblemCodesTab } from "./components/tabs/ProblemCodesTab";
 import { InsightsTab } from "./components/tabs/InsightsTab";
 import { BookmarksTab } from "./components/tabs/BookmarksTab";
 import { BrandGroupManagerModal } from "./components/modals/BrandGroupManagerModal";
+import { SyncModal } from "./components/modals/SyncModal";
 
 import {
   getMetadata,
@@ -65,6 +66,7 @@ export const App: React.FC = () => {
 
   // Modals
   const [isBrandManagerOpen, setIsBrandManagerOpen] = useState<boolean>(false);
+  const [isSyncModalOpen, setIsSyncModalOpen] = useState<boolean>(false);
 
   // 1. Initial Load: Metadata
   const fetchMetadata = async () => {
@@ -80,95 +82,86 @@ export const App: React.FC = () => {
     fetchMetadata();
   }, []);
 
-  // 2. Apply Filters Handler (Triggered explicitly by User via Button or Enter)
-  const handleApplyFilters = useCallback(() => {
-    setAppliedFilters({ ...stagedFilters });
-  }, [stagedFilters]);
+  // 2. Fetch Tab Specific Data
+  const fetchDashboardData = useCallback(async () => {
+    if (activeTab === "overview") {
+      setLoadingOverview(true);
+      try {
+        const data = await getOverviewStats(appliedFilters);
+        setOverviewStats(data);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoadingOverview(false);
+      }
+    } else if (activeTab === "monthly") {
+      setLoadingMonthly(true);
+      try {
+        const data = await getMonthlyStats(appliedFilters);
+        setMonthlyStats(data);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoadingMonthly(false);
+      }
+    } else if (activeTab === "problems") {
+      setLoadingProblems(true);
+      try {
+        const data = await getProblemCodes(appliedFilters, 30);
+        setPatientProblems(data.patient_problems || []);
+        setProductProblems(data.product_problems || []);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoadingProblems(false);
+      }
+    } else if (activeTab === "insights") {
+      setLoadingInsights(true);
+      try {
+        const data = await getInsights(appliedFilters);
+        setInsightsData(data);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setLoadingInsights(false);
+      }
+    }
+  }, [activeTab, appliedFilters]);
 
-  // 3. Reset Filters
-  const handleResetFilters = useCallback(() => {
+  useEffect(() => {
+    fetchDashboardData();
+  }, [fetchDashboardData]);
+
+  // Apply filters trigger
+  const handleApplyFilters = () => {
+    setAppliedFilters(stagedFilters);
+  };
+
+  // Reset filters
+  const handleResetFilters = () => {
     setStagedFilters(INITIAL_FILTERS);
     setAppliedFilters(INITIAL_FILTERS);
-  }, []);
+  };
 
-  // 4. Data Fetchers consuming appliedFilters
-  const loadOverview = useCallback(async () => {
-    setLoadingOverview(true);
-    try {
-      const data = await getOverviewStats(appliedFilters);
-      setOverviewStats(data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoadingOverview(false);
-    }
-  }, [appliedFilters]);
-
-  const loadMonthly = useCallback(async () => {
-    setLoadingMonthly(true);
-    try {
-      const data = await getMonthlyStats(appliedFilters);
-      setMonthlyStats(data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoadingMonthly(false);
-    }
-  }, [appliedFilters]);
-
-  const loadProblemCodes = useCallback(async () => {
-    setLoadingProblems(true);
-    try {
-      const data = await getProblemCodes(appliedFilters, 30);
-      setPatientProblems(data.patient_problems);
-      setProductProblems(data.product_problems);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoadingProblems(false);
-    }
-  }, [appliedFilters]);
-
-  const loadInsights = useCallback(async () => {
-    setLoadingInsights(true);
-    try {
-      const data = await getInsights(appliedFilters);
-      setInsightsData(data);
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoadingInsights(false);
-    }
-  }, [appliedFilters]);
-
-  // Tab change & Applied filters change effect
-  useEffect(() => {
-    if (activeTab === "overview") loadOverview();
-    if (activeTab === "monthly") loadMonthly();
-    if (activeTab === "problems") loadProblemCodes();
-    if (activeTab === "insights") loadInsights();
-  }, [activeTab, appliedFilters, loadOverview, loadMonthly, loadProblemCodes, loadInsights]);
-
-  // After brand group saved in modal
+  // On Brand Group Saved
   const handleBrandGroupsSaved = () => {
     fetchMetadata();
-    // Refresh current tab
-    if (activeTab === "overview") loadOverview();
-    if (activeTab === "monthly") loadMonthly();
-    if (activeTab === "insights") loadInsights();
+    fetchDashboardData();
   };
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-slate-950 text-slate-100 overflow-hidden font-sans">
-      {/* Top Global Header & Navigation */}
+    <div className="flex flex-col h-screen w-screen bg-slate-950 text-slate-100 font-sans overflow-hidden">
+      {/* Header */}
       <Header
         activeTab={activeTab}
         setActiveTab={setActiveTab}
-        totalRecords={metadata?.total_reports || 0}
+        totalRecords={metadata?.total_reports || 3979575}
+        dbPath={metadata?.db_path}
+        onOpenSyncModal={() => setIsSyncModalOpen(true)}
       />
 
-      {/* Main Content Area: Sidebar + Active View */}
-      <div className="flex-1 flex overflow-hidden">
+      {/* Main Content Layout */}
+      <div className="flex flex-1 overflow-hidden">
         {/* Left Filter Sidebar */}
         <Sidebar
           stagedFilters={stagedFilters}
@@ -188,6 +181,7 @@ export const App: React.FC = () => {
               loading={loadingOverview}
               filters={appliedFilters}
               metadata={metadata}
+              onOpenSyncModal={() => setIsSyncModalOpen(true)}
             />
           )}
 
@@ -243,6 +237,17 @@ export const App: React.FC = () => {
         isOpen={isBrandManagerOpen}
         onClose={() => setIsBrandManagerOpen(false)}
         onSaved={handleBrandGroupsSaved}
+      />
+
+      {/* Real-time OpenFDA Sync Engine Modal */}
+      <SyncModal
+        isOpen={isSyncModalOpen}
+        onClose={() => setIsSyncModalOpen(false)}
+        metadata={metadata}
+        onSyncCompleted={() => {
+          fetchMetadata();
+          fetchDashboardData();
+        }}
       />
     </div>
   );

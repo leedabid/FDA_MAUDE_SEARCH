@@ -14,14 +14,16 @@ import {
   Maximize2,
   Minimize2,
   MoveVertical,
+  RefreshCw,
 } from "lucide-react";
 import type { OverviewStats, FilterState, Metadata } from "../../types";
 
 interface OverviewTabProps {
   stats: OverviewStats | null;
   loading: boolean;
-  filters?: FilterState;
-  metadata?: Metadata | null;
+  filters: FilterState;
+  metadata: Metadata | null;
+  onOpenSyncModal?: () => void;
 }
 
 export const OverviewTab: React.FC<OverviewTabProps> = ({
@@ -29,6 +31,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
   loading,
   filters,
   metadata,
+  onOpenSyncModal,
 }) => {
   const [brandViewMode, setBrandViewMode] = useState<"canonical" | "raw">("canonical");
   const [scaleMode, setScaleMode] = useState<"linear" | "log">("linear");
@@ -257,11 +260,20 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             <Database className="w-4 h-4" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-bold text-white">데이터베이스 수집 범위</span>
               <span className="text-[11px] px-2 py-0.5 rounded-md bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 font-mono">
-                2020-01 ~ 2026-08 (총 {metadata?.total_reports?.toLocaleString() || "3,979,575"}건)
+                {metadata?.min_date || "2020-01"} ~ {metadata?.max_date || "2026-08"} (총 {metadata?.total_reports?.toLocaleString() || "3,979,575"}건)
               </span>
+              <button
+                type="button"
+                onClick={onOpenSyncModal}
+                className="text-[11px] px-2.5 py-0.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold transition flex items-center gap-1 shadow-md shadow-indigo-600/30 cursor-pointer"
+                title="OpenFDA 실시간 데이터 수집 / 갱신 모달 열기"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>최신 데이터 수집 / 갱신</span>
+              </button>
             </div>
             <p className="text-[11px] text-slate-400 mt-0.5">
               FDA MAUDE 연속혈당측정기(CGM) 및 인슐린 펌프 부작용 전수 데이터베이스

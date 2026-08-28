@@ -17,6 +17,7 @@ interface HeaderProps {
   totalRecords: number;
   dbPath?: string;
   bookmarkCount?: number;
+  onOpenSyncModal?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -25,6 +26,7 @@ export const Header: React.FC<HeaderProps> = ({
   totalRecords,
   dbPath,
   bookmarkCount = 0,
+  onOpenSyncModal,
 }) => {
   const navItems = [
     { id: "overview", label: "종합 개요", icon: BarChart3 },
@@ -59,17 +61,22 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
         </div>
 
-        {/* Database Metric Badge */}
-        <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-slate-800/60 border border-slate-700/60 rounded-xl text-xs text-slate-300">
-          <Database className="w-3.5 h-3.5 text-indigo-400" />
+        {/* Database Metric & Sync Trigger Badge */}
+        <button
+          onClick={onOpenSyncModal}
+          type="button"
+          title="OpenFDA 최신 데이터 수집 / 갱신 모달 열기"
+          className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 hover:border-indigo-500/50 rounded-xl text-xs text-slate-300 transition group cursor-pointer"
+        >
+          <Database className="w-3.5 h-3.5 text-indigo-400 group-hover:scale-110 transition" />
           <span>전체 DB:</span>
           <span className="font-semibold text-white font-mono">
             {totalRecords ? totalRecords.toLocaleString() : "3,979,575"}
           </span>
-          <span className="text-[10px] text-indigo-300 bg-indigo-500/10 px-1.5 py-0.5 rounded border border-indigo-500/20 flex items-center gap-1">
-            <Cpu className="w-3 h-3" /> FTS5 High-Speed
+          <span className="text-[10px] text-indigo-300 bg-indigo-500/20 group-hover:bg-indigo-500/30 px-1.5 py-0.5 rounded border border-indigo-500/30 flex items-center gap-1">
+            🔄 DB 갱신
           </span>
-        </div>
+        </button>
       </div>
 
       {/* Main Tabs Navigation */}

@@ -58,6 +58,42 @@ class BookmarkPayload(BaseModel):
     note: str = ""
 
 
+class SyncRequestPayload(BaseModel):
+    mode: str = "incremental"
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    categories: Optional[List[str]] = None
+
+
+# ---------------------------------------------------------------------------
+# Sync Engine Endpoints
+# ---------------------------------------------------------------------------
+from server import sync_engine
+import asyncio
+
+@app.get("/api/sync/status")
+def get_sync_status() -> Dict[str, Any]:
+    """Returns the current real-time OpenFDA synchronization state and progress logs."""
+    return sync_engine.get_sync_status()
+
+
+@app.post("/api/sync/start")
+async def start_sync(payload: SyncRequestPayload) -> Dict[str, Any]:
+    """Triggers an asynchronous OpenFDA incremental or custom date range synchronization."""
+    if sync_engine.SYNC_STATE["is_running"]:
+        return {"status": "already_running", "message": "이미 동기화 작업이 진행 중입니다."}
+
+    asyncio.create_task(
+        sync_engine.run_incremental_sync(
+            date_from=payload.date_from,
+            date_to=payload.date_to,
+            categories=payload.categories,
+            mode=payload.mode,
+        )
+    )
+    return {"status": "started", "message": "OpenFDA 동기화가 백그라운드에서 시작되었습니다."}
+
+
 # ---------------------------------------------------------------------------
 # Metadata & Filter Discovery Endpoints
 # ---------------------------------------------------------------------------

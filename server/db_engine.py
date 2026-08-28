@@ -413,9 +413,9 @@ def query_reports(
             SELECT r.report_number, r.mdr_report_key, r.event_type, r.date_received, r.date_of_event,
                    r.brand_name, r.device_category, r.manufacturer_name, r.patient_problems, r.product_problems,
                    r.summary_complaint_kr, r.summary_response_kr, r.summary_conclusion_kr,
-                   ((t.event_description IS NOT NULL AND length(t.event_description) > 5) OR
-                    (t.manufacturer_narrative IS NOT NULL AND length(t.manufacturer_narrative) > 5) OR
-                    (t.additional_manufacturer_narrative IS NOT NULL AND length(t.additional_manufacturer_narrative) > 5)) AS has_real_narrative
+                   ((t.event_description IS NOT NULL AND length(trim(t.event_description)) > 10) OR
+                    (t.manufacturer_narrative IS NOT NULL AND length(trim(t.manufacturer_narrative)) > 10) OR
+                    (t.additional_manufacturer_narrative IS NOT NULL AND length(trim(t.additional_manufacturer_narrative)) > 10)) AS has_real_narrative
             FROM {from_sql}
             LEFT JOIN maude_reports_text t ON t.report_number = r.report_number
             WHERE {where_sql}
@@ -427,23 +427,7 @@ def query_reports(
         for r in cursor.fetchall():
             row_dict = dict(r)
             has_narr = bool(row_dict.get("has_real_narrative"))
-            
-            p_prob = str(row_dict.get("patient_problems") or "").strip()
-            d_prob = str(row_dict.get("product_problems") or "").strip()
-            
-            has_valid_patient_code = bool(p_prob and p_prob != "None" and p_prob != "No Information" and p_prob != "No Clinical Signs, Symptoms or Conditions")
-            has_valid_product_code = bool(d_prob and d_prob != "None" and d_prob != "No Information" and len(d_prob) > 2)
-            has_codes = has_valid_patient_code or has_valid_product_code
-
-            if has_narr:
-                content_status = "narrative"
-            elif has_codes:
-                content_status = "codes"
-            else:
-                content_status = "none"
-
             row_dict["has_narrative"] = has_narr
-            row_dict["content_status"] = content_status
             rows.append(row_dict)
 
         count_sql = f"SELECT count(*) FROM (SELECT 1 FROM {from_sql} WHERE {where_sql} LIMIT 2000)"

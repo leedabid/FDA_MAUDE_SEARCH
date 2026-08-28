@@ -294,29 +294,21 @@ export const ReportsTab: React.FC<ReportsTabProps> = ({
                         </span>
                       </td>
                       <td className="py-3 px-3 text-center">
-                        {report.content_status === "narrative" || report.has_narrative ? (
+                        {report.has_narrative ? (
                           <span
-                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
-                            title="환자 서술 및 제조사 답변 등 영어 장문 원문(Narrative)이 완벽하게 등록된 보고서"
+                            className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 shadow-sm"
+                            title="영어 원문 내러티브(환자 서술 또는 제조사 분석 서술)가 등록되어 있습니다."
                           >
                             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                            원문 O
-                          </span>
-                        ) : report.content_status === "codes" || (report.product_problems || report.patient_problems) ? (
-                          <span
-                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30"
-                            title="장문 서술 원문은 없으나, FDA 표준 문제 코드(IMDRF/Annex) 및 결함 정보가 등록된 보고서"
-                          >
-                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
-                            코드 O
+                            O (있음)
                           </span>
                         ) : (
                           <span
-                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-500 border border-slate-700"
-                            title="보고 원문 텍스트 및 상세 문제 코드가 없는 보고서"
+                            className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-slate-800/80 text-slate-400 border border-slate-700"
+                            title="영어 원문 서술 내용(내러티브)이 없는 보고서입니다."
                           >
                             <span className="w-1.5 h-1.5 rounded-full bg-slate-500"></span>
-                            없음 X
+                            X (없음)
                           </span>
                         )}
                       </td>

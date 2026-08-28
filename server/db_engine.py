@@ -70,8 +70,9 @@ def reload_brand_groups():
                 groups = data.get("groups", data)
                 categories = data.get("categories", {})
                 for canon, members in groups.items():
-                    CANONICAL_TO_MEMBERS[canon] = [m.upper().strip() for m in members]
+                    CANONICAL_TO_MEMBERS[canon] = [m.strip() for m in members]
                     for m in members:
+                        MEMBER_TO_CANONICAL[m.strip()] = canon
                         MEMBER_TO_CANONICAL[m.upper().strip()] = canon
                 CANONICAL_CATEGORIES = categories
         except Exception as e:
@@ -127,11 +128,11 @@ def _build_filter_clauses(
                 for member in CANONICAL_TO_MEMBERS[matched_canon]:
                     all_raw_targets.add(member)
             else:
-                all_raw_targets.add(b_norm.upper())
+                all_raw_targets.add(b_norm)
 
         if all_raw_targets:
             placeholders = ",".join(["?"] * len(all_raw_targets))
-            clauses.append(f"UPPER({prefix}brand_name) IN ({placeholders})")
+            clauses.append(f"{prefix}brand_name IN ({placeholders})")
             params.extend(list(all_raw_targets))
 
     # 3. Event Types
@@ -372,11 +373,11 @@ def get_stats_monthly(
     with get_sqlite_conn() as conn:
         rows = conn.execute(
             f"""
-            SELECT s.year_month, s.brand_name, s.event_type, sum(s.report_count) as cnt
+            SELECT s.month, s.brand_name, s.event_type, sum(s.report_count) as cnt
             FROM maude_monthly_summary s
             WHERE {where_sql}
-            GROUP BY s.year_month, s.brand_name, s.event_type
-            ORDER BY s.year_month ASC
+            GROUP BY s.month, s.brand_name, s.event_type
+            ORDER BY s.month ASC
             """,
             params,
         ).fetchall()
@@ -597,8 +598,8 @@ def get_problem_codes_stats(
             f"""
             SELECT r.brand_name, r.patient_problems, r.product_problems
             FROM maude_reports r
-            WHERE {where_sql} AND (r.patient_problems IS NOT NULL OR r.product_problems IS NOT NULL)
-            LIMIT 50000
+            WHERE {where_sql}
+            LIMIT 2000
             """,
             params,
         ).fetchall()
@@ -682,22 +683,20 @@ def get_insights(
     with get_sqlite_conn() as conn:
         rows = conn.execute(
             f"""
-            SELECT s.year_month, s.brand_name, s.event_type, s.report_source_code, sum(s.report_count)
+            SELECT s.month, s.brand_name, s.event_type, sum(s.report_count)
             FROM maude_monthly_summary s
             WHERE {where_sql}
-            GROUP BY s.year_month, s.brand_name, s.event_type, s.report_source_code
+            GROUP BY s.month, s.brand_name, s.event_type
             """,
             params,
         ).fetchall()
 
     canonical_severity: Dict[str, Dict[str, int]] = {}
     raw_severity: Dict[str, Dict[str, int]] = {}
-    pathways_dist: Dict[str, int] = {}
-    pathways_timeline_map: Dict[str, Dict[str, int]] = {}
     monthly_trend_map: Dict[str, int] = {}
 
     for r in rows:
-        ym, raw_b, et, src, cnt = r[0], r[1], r[2], r[3] or "Unknown", r[4]
+        ym, raw_b, et, cnt = r[0], r[1], r[2], r[3]
         c_brand = MEMBER_TO_CANONICAL.get(raw_b.upper().strip(), raw_b)
 
         if c_brand not in canonical_severity:
@@ -708,21 +707,35 @@ def get_insights(
             raw_severity[raw_b] = {"Death": 0, "Injury": 0, "Malfunction": 0, "Other": 0}
         raw_severity[raw_b][et] = raw_severity[raw_b].get(et, 0) + cnt
 
-        pathways_dist[src] = pathways_dist.get(src, 0) + cnt
-
-        if ym not in pathways_timeline_map:
-            pathways_timeline_map[ym] = {}
-        pathways_timeline_map[ym][src] = pathways_timeline_map[ym].get(src, 0) + cnt
-
         monthly_trend_map[ym] = monthly_trend_map.get(ym, 0) + cnt
 
-    all_sources = sorted(pathways_dist.keys())
-    pathways_timeline = []
-    for ym in sorted(pathways_timeline_map.keys()):
-        item: Dict[str, Any] = {"month": ym}
-        for s in all_sources:
-            item[s] = pathways_timeline_map[ym].get(s, 0)
-        pathways_timeline.append(item)
+    # Pathways distribution from indexed sample
+    r_clauses, r_params = _build_filter_clauses(
+        categories=categories,
+        brands=brands,
+        event_types=event_types,
+        date_from=date_from,
+        date_to=date_to,
+        code_filter=code_filter,
+        prefix="r.",
+    )
+    r_where = " AND ".join(r_clauses) if r_clauses else "1=1"
+    
+    with get_sqlite_conn() as conn:
+        src_rows = conn.execute(
+            f"""
+            SELECT report_source_code, count(*)
+            FROM (
+                SELECT report_source_code
+                FROM maude_reports r
+                WHERE {r_where}
+                LIMIT 2000
+            ) sub
+            GROUP BY report_source_code
+            """,
+            r_params,
+        ).fetchall()
+        pathways_dist = { (r[0] or "Voluntary report"): r[1] for r in src_rows }
 
     recent_trend = [
         {"month": ym, "count": monthly_trend_map[ym]}
@@ -733,7 +746,7 @@ def get_insights(
         "canonical_severity": canonical_severity,
         "raw_severity": raw_severity,
         "pathways_distribution": pathways_dist,
-        "pathways_timeline": pathways_timeline,
+        "pathways_timeline": [],
         "recent_month_trend": recent_trend,
     }
 

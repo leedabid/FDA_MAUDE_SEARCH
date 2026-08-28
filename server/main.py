@@ -232,13 +232,17 @@ def get_problem_codes_stats(
 
 
 @app.post("/api/insights")
+@app.post("/api/stats/insights")
 def get_insights_data(payload: FilterPayload) -> Dict[str, Any]:
     """Deep Safety Insights: severity matrices, reporting pathways, and anomaly trends."""
-    return engine.get_insights_data(
+    return engine.get_insights(
         categories=payload.categories,
         brands=payload.brands,
+        event_types=payload.event_types,
         date_from=payload.date_from,
         date_to=payload.date_to,
+        keyword=payload.keyword,
+        code_filter=payload.code_filter,
     )
 
 

@@ -37,7 +37,10 @@ import hashlib
 import json
 import re
 import requests
+import os
 import sqlite3
+import zlib
+import time
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -52,19 +55,163 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "fda_maude_cgm.db"
+
+# v2 는 raw_json 을 별도 테이블로 뺀 "세로 분할" 스키마다. 필터가 훑는 행이
+# 10.9KB -> 0.6KB 로 얇아지고 커버링 인덱스가 붙어 있어 조회가 훨씬 빠르다.
+# 빌드가 끝나 FTS 까지 갖춰졌을 때만 v2 를 쓰고, 그 전에는 기존 DB 로 동작한다.
+DB_PATH_V1 = BASE_DIR / "fda_maude_cgm.db"
+DB_PATH_V2 = BASE_DIR / "fda_maude_cgm_v2.db"
+
+
+def _v2_ready(path: Path) -> bool:
+    """v2 DB 가 조회 가능한 상태(본문 테이블 + FTS 존재)인지 확인."""
+    if not path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            names = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
+                )
+            }
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return {"maude_reports", "maude_reports_text",
+            "maude_reports_raw", "maude_reports_fts"} <= names
+
+
+# MAUDE_DB_PATH 로 조회 대상 DB 를 바꿀 수 있다. 재구축 중인 DB 를 미리
+# 검증하거나, 예전 DB 로 되돌려 비교할 때 쓴다.
+_DB_OVERRIDE = os.environ.get("MAUDE_DB_PATH", "").strip()
+if _DB_OVERRIDE:
+    DB_PATH = Path(_DB_OVERRIDE)
+    USE_V2 = _v2_ready(DB_PATH)
+else:
+    USE_V2 = _v2_ready(DB_PATH_V2)
+    DB_PATH = DB_PATH_V2 if USE_V2 else DB_PATH_V1
 BRAND_GROUPS_PATH = BASE_DIR / "brand_groups.json"
+FILTER_METADATA_CACHE_PATH = BASE_DIR / ".maude_filter_metadata_cache.json"
 PROBLEM_CODE_MAP_PATH = BASE_DIR / "problem_code_map.json"
 ANNEX_XLSX_PATH = BASE_DIR / "fda-annexes-a-g-2025.xlsx"
 BRAND_GROUPS: Dict[str, List[str]] = {}
 CANONICAL_TO_MEMBERS: Dict[str, List[str]] = {}
 MEMBER_TO_CANONICAL: Dict[str, str] = {}
 
+# 브랜드가 일부만 선택되거나 데이터 건수 순서가 달라져도 모든 비교 그래프에서
+# 같은 브랜드가 항상 같은 순서와 색을 갖도록 하는 전역 규칙.
+PRIMARY_BRAND_ORDER = (
+    "Dexcom G6",
+    "Dexcom G7",
+    "Dexcom G7 15 Day",
+    "Libre 2",
+    "Libre 2+",
+    "Libre 3",
+    "Libre 3+",
+)
+PRIMARY_BRAND_COLORS = (
+    "#1F77B4",  # Dexcom G6
+    "#17BECF",  # Dexcom G7
+    "#0B6E99",  # Dexcom G7 15 Day
+    "#FF7F0E",  # Libre 2
+    "#E5AE38",  # Libre 2+
+    "#2CA02C",  # Libre 3
+    "#9467BD",  # Libre 3+
+)
+_FALLBACK_BRAND_COLORS = (
+    "#D62728", "#8C564B", "#E377C2", "#7F7F7F", "#BCBD22",
+    "#AEC7E8", "#FFBB78", "#98DF8A", "#FF9896", "#C5B0D5",
+    "#C49C94", "#F7B6D2", "#C7C7C7", "#DBDB8D", "#9EDAE5",
+)
+
+
+def _brand_identity(value: object) -> str:
+    """띄어쓰기·대소문자 차이를 무시한 브랜드 색상/순서 식별자."""
+    return re.sub(r"[^a-z0-9+]", "", str(value or "").casefold())
+
+
+_PRIMARY_BRAND_RANK = {
+    _brand_identity(name): rank for rank, name in enumerate(PRIMARY_BRAND_ORDER)
+}
+_PRIMARY_BRAND_COLOR_MAP = {
+    _brand_identity(name): color
+    for name, color in zip(PRIMARY_BRAND_ORDER, PRIMARY_BRAND_COLORS)
+}
+
+
+def _natural_brand_key(value: object) -> Tuple[Tuple[int, object], ...]:
+    parts = re.split(r"(\d+)", str(value or "").casefold())
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in parts if part != ""
+    )
+
+
+def _brand_sort_key(value: object) -> Tuple[int, int, Tuple[Tuple[int, object], ...]]:
+    identity = _brand_identity(value)
+    rank = _PRIMARY_BRAND_RANK.get(identity)
+    if rank is not None:
+        return (0, rank, _natural_brand_key(value))
+    return (1, len(PRIMARY_BRAND_ORDER), _natural_brand_key(value))
+
+
+def _ordered_brand_names(values) -> List[str]:
+    """지정 7개 브랜드 우선순위 후 나머지를 자연 정렬."""
+    unique = {str(value) for value in values if str(value).strip()}
+    return sorted(unique, key=_brand_sort_key)
+
+
+def _brand_color(value: object) -> str:
+    """브랜드 이름만으로 결정되는 고정 색상."""
+    identity = _brand_identity(value)
+    fixed = _PRIMARY_BRAND_COLOR_MAP.get(identity)
+    if fixed:
+        return fixed
+    digest = int(hashlib.md5(identity.encode("utf-8")).hexdigest(), 16)
+    return _FALLBACK_BRAND_COLORS[digest % len(_FALLBACK_BRAND_COLORS)]
+
+
+def _brand_color_scale(brand_order: List[str]) -> alt.Scale:
+    return alt.Scale(
+        domain=brand_order,
+        range=[_brand_color(brand) for brand in brand_order],
+    )
+
 PATIENT_PROBLEM_LABEL = "Health Effect - Clinical Code"
 DEVICE_PROBLEM_LABEL = "Medical Device Problem Code"
 CODE_FILTER_TOKEN = "__MAUDE_CODE_FILTER__="
 REPORT_STAGE_TOKEN = "__MAUDE_REPORT_STAGE__="
 ID_FILTER_TOKEN = "__MAUDE_ID_FILTER__="
+KEYWORD_SEARCH_EXAMPLES = [
+    "inaccurate reading",
+    "false low",
+    "false high",
+    "signal loss",
+    "no readings",
+    "sensor failure",
+    "sensor error",
+    "alarm",
+    "adhesive",
+    "skin irritation",
+    "bleeding",
+    "pain",
+    "applicator",
+    "insertion",
+    "transmitter",
+    "calibration",
+]
+DASHBOARD_PAGE_OPTIONS = [
+    "🔍 인사이트",
+    "📋 전체 보고서",
+    "⚠️ EVENT_TYPE 분포",
+    "🏥 문제 코드",
+    "🔬 상세 월별 분석",
+    "👤 환자 인구통계",
+    "🏭 제조사 · 국가",
+    "📈 월별 추이",
+]
 
 st.set_page_config(
     page_title="FDA MAUDE CGM 부작용 대시보드",
@@ -91,11 +238,30 @@ def _db_signature() -> Tuple[bool, int, float]:
     return (True, int(stt.st_size), float(stt.st_mtime))
 
 
+# 조회용 connection 튜닝값.
+#
+# SQLite 기본 cache_size 는 2MB 라서 수 GB 짜리 DB 에서는 매 질의가 사실상
+# 콜드 디스크 읽기가 된다. 실측에서 같은 COUNT 가 콜드 59.5초 / 워밍 0.09초로
+# 660배 차이가 났다. 페이지 캐시와 mmap 을 키워 그 격차를 줄인다.
+_PRAGMA_CACHE_KIB = 1_048_576          # 1GB (음수 = KiB 단위)
+_PRAGMA_MMAP_BYTES = 8 * 1024 ** 3     # 8GB
+
+
 def _connect() -> sqlite3.Connection:
     """읽기 전용 connection. 캐시 무효화를 위해 파일 mtime 을 키로 사용."""
     _ = _db_last_modified()  # mtime 체크만
     conn = sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro&immutable=1", uri=True, timeout=30)
     conn.execute("PRAGMA busy_timeout = 30000")
+    # 아래 PRAGMA 는 실패해도 조회 자체는 가능하므로 조용히 넘어간다.
+    for pragma in (
+        f"PRAGMA cache_size = -{_PRAGMA_CACHE_KIB}",
+        f"PRAGMA mmap_size = {_PRAGMA_MMAP_BYTES}",
+        "PRAGMA temp_store = MEMORY",
+    ):
+        try:
+            conn.execute(pragma)
+        except sqlite3.Error:
+            pass
     return conn
 
 def _parse_code_numbers(raw: str) -> List[str]:
@@ -115,9 +281,302 @@ def _parse_code_numbers(raw: str) -> List[str]:
 
 def _normalize_report_stage(raw: str) -> str:
     s = str(raw or "").strip().lower()
-    if s in ("initial", "followup"):
+    if s in ("all", "initial", "followup1", "followup2", "followup3plus"):
         return s
+    if s in ("followup", "followup_any"):
+        return "followup1"
     return "all"
+
+
+def _normalize_report_stage_list(raw) -> List[str]:
+    """Type of Report 선택값을 정규화된 리스트로 반환."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        stage = _normalize_report_stage(raw)
+        return [] if stage == "all" else [stage]
+
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in raw:
+        stage = _normalize_report_stage(item)
+        if stage == "all" or stage in seen:
+            continue
+        seen.add(stage)
+        out.append(stage)
+    return out
+
+
+def _report_followup_count_expr() -> str:
+    """Type of Report의 followup 횟수를 계산하는 SQL 표현식.
+
+    openFDA raw_json 에는 type_of_report 가 배열로 들어가는 경우가 있어
+    문자열 단순 검색보다 배열 길이를 쓰는 편이 정확하다.
+    예:
+      ["Initial submission"]                     -> 0회 followup
+      ["Initial submission", "Followup"]         -> 1회 followup
+      ["Initial submission", "Followup", ...]    -> 2회 이상 followup
+    """
+    if USE_V2:
+        # v2 에는 raw_json 이 이 테이블에 없다. 대신 수집 단계에서 배열을
+        # 합쳐 넣은 type_of_report 문자열에서 'followup' 출현 횟수를 센다.
+        low = "LOWER(COALESCE(type_of_report, ''))"
+        return (
+            f"((LENGTH({low}) - LENGTH(REPLACE({low}, 'followup', ''))) "
+            f"/ LENGTH('followup'))"
+        )
+    raw_type_expr = "json_extract(raw_json, '$.type_of_report')"
+    array_len_expr = f"COALESCE(json_array_length({raw_type_expr}), 0)"
+    # array_len 이 0이면 정보가 없는 것으로 보고 0회로 처리.
+    return f"CASE WHEN {array_len_expr} > 0 THEN ({array_len_expr} - 1) ELSE 0 END"
+
+
+def _report_stage_clause(report_stage) -> Tuple[str, List[str]]:
+    """Type of Report 필터 절 생성."""
+    stages = _normalize_report_stage_list(report_stage)
+    if not stages:
+        return "", []
+
+    followup_count = _report_followup_count_expr()
+    # initial 존재 여부는 raw_json 문자열/컬럼 모두를 함께 확인한다.
+    source_expr = (
+        "LOWER(COALESCE(type_of_report, ''))" if USE_V2
+        else "LOWER(COALESCE(NULLIF(type_of_report, ''), raw_json, ''))"
+    )
+    has_initial = f"{source_expr} LIKE '%initial%'"
+
+    parts: List[str] = []
+    for stage in stages:
+        if stage == "initial":
+            parts.append(f"({has_initial} AND {followup_count} = 0)")
+        elif stage == "followup1":
+            parts.append(f"({has_initial} AND {followup_count} = 1)")
+        elif stage == "followup2":
+            parts.append(f"({has_initial} AND {followup_count} = 2)")
+        elif stage == "followup3plus":
+            parts.append(f"({has_initial} AND {followup_count} >= 3)")
+
+    if not parts:
+        return "", []
+    if len(parts) == 1:
+        return parts[0], []
+    return "(" + " OR ".join(parts) + ")", []
+
+
+def _report_stage_display(report_stage) -> str:
+    mapping = {
+        "all": "(전체)",
+        "initial": "초기 보고만",
+        "followup1": "Followup 1회",
+        "followup2": "Followup 2회",
+        "followup3plus": "Followup 3회 이상",
+    }
+    stages = _normalize_report_stage_list(report_stage)
+    if not stages:
+        return "(전체)"
+    return ", ".join(mapping.get(stage, stage) for stage in stages)
+
+
+# trigram FTS5 는 3글자 이상만 색인한다. 그보다 짧은 검색어는 인덱스를 쓸 수
+# 없으므로 본문 테이블 LIKE 로 처리한다(짧은 검색어는 후보가 많아 어차피 느리다).
+_FTS_MIN_CHARS = 3
+
+
+def _fts_subquery(term: str) -> Tuple[str, List]:
+    """본문 텍스트에서 term 을 찾는 서브쿼리 절과 파라미터를 만든다.
+
+    v2 는 본문이 maude_reports_text 로 빠져 있고 trigram FTS5 가 걸려 있다.
+    trigram 은 LIKE '%term%' 과 같은 부분일치 의미를 그대로 지원하므로,
+    기존 검색 동작을 바꾸지 않으면서 전체 스캔을 피할 수 있다.
+    """
+    if len(term) >= _FTS_MIN_CHARS:
+        return (
+            "report_number IN ("
+            " SELECT t.report_number FROM maude_reports_text t"
+            " JOIN maude_reports_fts f ON f.rowid = t.rid"
+            " WHERE maude_reports_fts MATCH ?)",
+            [f'"{term}"'],
+        )
+    like = f"%{term}%"
+    return (
+        "report_number IN ("
+        " SELECT t.report_number FROM maude_reports_text t"
+        " WHERE t.event_description LIKE ?"
+        " OR t.manufacturer_narrative LIKE ?"
+        " OR t.additional_manufacturer_narrative LIKE ?)",
+        [like, like, like],
+    )
+
+
+def _build_filter_components(
+    brands: List[str],
+    event_types: List[str],
+    date_from: Optional[date],
+    date_to: Optional[date],
+    keyword: str,
+) -> Tuple[List[str], List, List[str], List]:
+    """(base clauses, base params, text clauses, text params) 반환.
+
+    base: date/brand/event/type_of_report 같이 인덱스를 타기 쉬운 조건
+    text: event_description / narrative / raw_json 처럼 비싼 문자열 검색
+    """
+    base_clauses: List[str] = []
+    base_params: List = []
+    text_clauses: List[str] = []
+    text_params: List = []
+    keyword_text, code_filters, report_stage, id_filters = _split_search_keyword(keyword)
+
+    if brands:
+        expanded_brands: List[str] = []
+        seen: Set[str] = set()
+        for chosen in brands:
+            members = CANONICAL_TO_MEMBERS.get(chosen)
+            if members is not None:
+                for member in members:
+                    if member not in seen:
+                        expanded_brands.append(member)
+                        seen.add(member)
+            else:
+                if chosen not in seen:
+                    expanded_brands.append(chosen)
+                    seen.add(chosen)
+        if len(expanded_brands) == 1:
+            base_clauses.append("brand_name = ?")
+            base_params.append(expanded_brands[0])
+        else:
+            placeholders = ",".join(["?"] * len(expanded_brands))
+            base_clauses.append(f"brand_name IN ({placeholders})")
+            base_params.extend(expanded_brands)
+
+    if event_types:
+        placeholders = ",".join(["?"] * len(event_types))
+        base_clauses.append(f"event_type IN ({placeholders})")
+        base_params.extend(event_types)
+
+    if date_from:
+        base_clauses.append("date_received >= ?")
+        base_params.append(date_from.isoformat())
+    if date_to:
+        base_clauses.append("date_received <= ?")
+        base_params.append(date_to.isoformat())
+
+    stage_clause, stage_params = _report_stage_clause(report_stage)
+    if stage_clause:
+        base_clauses.append(stage_clause)
+        base_params.extend(stage_params)
+
+    if keyword_text:
+        like = f"%{keyword_text}%"
+        available = set(detect_columns(_db_last_modified()))
+        # 좁은 테이블에 있는 짧은 칼럼들은 그대로 LIKE 로 본다. v2 에서는 이
+        # 테이블이 행당 0.6KB 라 스캔이 싸다.
+        narrow_parts = [
+            "summary_complaint_kr LIKE ?",
+            "summary_response_kr LIKE ?",
+            "patient_problems LIKE ?",
+            "product_problems LIKE ?",
+            "COALESCE(report_number, '') LIKE ?",
+            "COALESCE(mdr_report_key, '') LIKE ?",
+        ]
+        narrow_params = [like] * 6
+
+        if USE_V2:
+            # 본문(event_description / narrative)은 FTS 서브쿼리로 찾는다.
+            # 예전에는 raw_json 까지 LIKE 로 훑었는데, raw_json 은 같은 본문을
+            # 다시 담고 있을 뿐이라 중복이고 전체 스캔의 주범이었다. mdr_report_key
+            # 는 이미 독립 칼럼이므로 위에서 직접 비교한다.
+            fts_clause, fts_params = _fts_subquery(keyword_text)
+            text_parts = narrow_parts + [fts_clause]
+            text_params.extend(narrow_params + fts_params)
+        else:
+            mdr_key_like = f'%\"mdr_report_key\"%{keyword_text}%'
+            text_parts = [
+                "event_description LIKE ?",
+                "manufacturer_narrative LIKE ?",
+            ]
+            text_params.extend([like, like])
+            if "additional_manufacturer_narrative" in available:
+                text_parts.append("additional_manufacturer_narrative LIKE ?")
+                text_params.append(like)
+            text_parts.extend(narrow_parts[:-1] + ["COALESCE(raw_json, '') LIKE ?"])
+            text_params.extend(narrow_params[:-1] + [mdr_key_like])
+        text_clauses.append("(" + " OR ".join(text_parts) + ")")
+
+    if id_filters:
+        per_id_clauses: List[str] = []
+        for term in id_filters:
+            if _is_number_like_id(term):
+                resolved_report_number = ""
+                try:
+                    with _connect() as conn:
+                        row = conn.execute(
+                            "SELECT report_number FROM maude_reports WHERE report_number = ? LIMIT 1",
+                            (term,),
+                        ).fetchone()
+                    if row and row[0]:
+                        resolved_report_number = str(row[0]).strip()
+                except Exception:
+                    resolved_report_number = ""
+                if not resolved_report_number:
+                    resolved_report_number = _resolve_report_number_from_mdr_key(term)
+                if resolved_report_number:
+                    base_clauses.append("report_number = ?")
+                    base_params.append(resolved_report_number)
+                else:
+                    base_clauses.append(
+                        "("
+                        "COALESCE(mdr_report_key, '') = ? COLLATE NOCASE OR "
+                        "COALESCE(report_number, '') = ? COLLATE NOCASE"
+                        ")"
+                    )
+                    base_params.extend([term, term])
+            else:
+                like = f"%{term}%"
+                mdr_key_like = like if USE_V2 else f'%\"mdr_report_key\"%{term}%'
+                if USE_V2:
+                    # v2 는 mdr_report_key 가 독립 칼럼이라 raw_json 을
+                    # 문자열로 뒤질 필요가 없다.
+                    per_id_clauses.append(
+                        "("
+                        "COALESCE(report_number, '') LIKE ? COLLATE NOCASE OR "
+                        "COALESCE(mdr_report_key, '') LIKE ? COLLATE NOCASE"
+                        ")"
+                    )
+                else:
+                    per_id_clauses.append(
+                        "("
+                        "COALESCE(report_number, '') LIKE ? COLLATE NOCASE OR "
+                        "COALESCE(raw_json, '') LIKE ? COLLATE NOCASE"
+                        ")"
+                    )
+                text_params.extend([like, mdr_key_like])
+        if per_id_clauses:
+            text_clauses.append("(" + " OR ".join(per_id_clauses) + ")")
+
+    if code_filters:
+        code_term_map = _code_to_problem_terms(_db_last_modified(), _problem_code_map_mtime())
+        per_code_clauses: List[str] = []
+        for code in code_filters:
+            one_code_clauses: List[str] = []
+            like_patterns: List[str] = [
+                f"%({code})%",
+                f"%{code}:%",
+                f"%{code} -%",
+                f"%{code}|%",
+            ]
+            terms = code_term_map.get(str(code), [])
+            for term in terms[:40]:
+                like_patterns.append(f"%{term}%")
+            for pat in like_patterns:
+                one_code_clauses.append(
+                    "(COALESCE(patient_problems, '') LIKE ? COLLATE NOCASE "
+                    "OR COALESCE(product_problems, '') LIKE ? COLLATE NOCASE)"
+                )
+                text_params.extend([pat, pat])
+            per_code_clauses.append("(" + " OR ".join(one_code_clauses) + ")")
+        text_clauses.append("(" + " OR ".join(per_code_clauses) + ")")
+
+    return base_clauses, base_params, text_clauses, text_params
 
 
 def _parse_id_search_terms(raw: str) -> List[str]:
@@ -147,63 +606,70 @@ def _is_number_like_id(term: str) -> bool:
 def _compose_search_keyword(
     keyword: str,
     code_search: str,
-    report_stage: str = "all",
+    report_stage = "all",
     id_search: str = "",
 ) -> str:
     """기존 keyword 파이프라인을 유지하면서 코드 필터를 함께 전달."""
     kw = str(keyword or "").strip()
     code_text = str(code_search or "").strip()
     id_text = str(id_search or "").strip()
-    stage = _normalize_report_stage(report_stage)
+    stages = _normalize_report_stage_list(report_stage)
     out = kw
     if code_text:
         out = (f"{out} " if out else "") + f"{CODE_FILTER_TOKEN}{code_text}"
     if id_text:
         out = (f"{out} " if out else "") + f"{ID_FILTER_TOKEN}{id_text}"
-    if stage != "all":
+    for stage in stages:
         out = (f"{out} " if out else "") + f"{REPORT_STAGE_TOKEN}{stage}"
     return out.strip()
 
 
-def _split_search_keyword(raw_keyword: str) -> Tuple[str, List[str], str, List[str]]:
+def _split_search_keyword(raw_keyword: str) -> Tuple[str, List[str], List[str], List[str]]:
     """합성된 keyword 문자열에서 (키워드, 코드목록, 보고구분, ID목록) 분리."""
     text = str(raw_keyword or "").strip()
     if not text:
-        return "", [], "all", []
+        return "", [], [], []
 
-    keyword = text
-    stage = "all"
+    keyword_parts: List[str] = []
     codes: List[str] = []
+    stages: List[str] = []
     ids: List[str] = []
 
-    stage_idx = keyword.find(REPORT_STAGE_TOKEN)
-    if stage_idx >= 0:
-        stage_text = keyword[stage_idx + len(REPORT_STAGE_TOKEN):].strip().split()[0] if keyword[stage_idx + len(REPORT_STAGE_TOKEN):].strip() else ""
-        stage = _normalize_report_stage(stage_text)
-        keyword = (keyword[:stage_idx] + " " + keyword[stage_idx + len(REPORT_STAGE_TOKEN) + len(stage_text):]).strip()
+    token_pattern = re.compile(
+        "("
+        + re.escape(CODE_FILTER_TOKEN)
+        + "|"
+        + re.escape(ID_FILTER_TOKEN)
+        + "|"
+        + re.escape(REPORT_STAGE_TOKEN)
+        + ")"
+    )
+    parts = token_pattern.split(text)
+    current_marker = ""
+    for part in parts:
+        if not part:
+            continue
+        if part in (CODE_FILTER_TOKEN, ID_FILTER_TOKEN, REPORT_STAGE_TOKEN):
+            current_marker = part
+            continue
+        if current_marker == CODE_FILTER_TOKEN:
+            codes.extend(_parse_code_numbers(part))
+        elif current_marker == ID_FILTER_TOKEN:
+            ids.extend(_parse_id_search_terms(part))
+        elif current_marker == REPORT_STAGE_TOKEN:
+            stage = _normalize_report_stage(part.strip().split()[0] if part.strip() else "")
+            if stage != "all" and stage not in stages:
+                stages.append(stage)
+        else:
+            keyword_parts.append(part)
+        current_marker = ""
 
-    id_idx = keyword.find(ID_FILTER_TOKEN)
-    if id_idx >= 0:
-        id_text = keyword[id_idx + len(ID_FILTER_TOKEN):].strip()
-        keyword = keyword[:id_idx].strip()
-        if CODE_FILTER_TOKEN in id_text:
-            id_text = id_text.split(CODE_FILTER_TOKEN, 1)[0].strip()
-        if REPORT_STAGE_TOKEN in id_text:
-            id_text = id_text.split(REPORT_STAGE_TOKEN, 1)[0].strip()
-        ids = _parse_id_search_terms(id_text)
-
-    code_idx = keyword.find(CODE_FILTER_TOKEN)
-    if code_idx >= 0:
-        code_text = keyword[code_idx + len(CODE_FILTER_TOKEN):].strip()
-        keyword = keyword[:code_idx].strip()
-        # code_text 안에 다른 토큰이 섞인 경우 방어
-        if ID_FILTER_TOKEN in code_text:
-            code_text = code_text.split(ID_FILTER_TOKEN, 1)[0].strip()
-        if REPORT_STAGE_TOKEN in code_text:
-            code_text = code_text.split(REPORT_STAGE_TOKEN, 1)[0].strip()
-        codes = _parse_code_numbers(code_text)
-
-    return keyword, codes, stage, ids
+    # 토큰 조합에서 공백으로 잘려 들어간 값은 원래 텍스트를 우선 보존.
+    keyword = " ".join(keyword_parts).strip()
+    codes = list(dict.fromkeys(codes))
+    stages = _normalize_report_stage_list(stages)
+    ids = list(dict.fromkeys(ids))
+    return keyword, codes, stages, ids
 
 
 @st.cache_data(show_spinner=False)
@@ -235,7 +701,16 @@ def detect_columns(mtime: float) -> List[str]:
     if not DB_PATH.exists():
         return []
     with _connect() as conn:
-        return [r[1] for r in conn.execute("PRAGMA table_info(maude_reports)").fetchall()]
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(maude_reports)")]
+        if USE_V2:
+            # 본문 텍스트는 maude_reports_text 에 있지만, 호출부 입장에서는
+            # "쓸 수 있는 칼럼"이라는 의미가 같으므로 합쳐서 돌려준다.
+            cols += [
+                r[1] for r in conn.execute("PRAGMA table_info(maude_reports_text)")
+                if r[1] not in ("rid", "report_number")
+            ]
+            cols.append("raw_json")  # maude_reports_raw 에서 압축 해제해 제공
+    return cols
 
 
 def _safe_col(available: List[str], col: str) -> str:
@@ -263,11 +738,15 @@ def load_brand_groups() -> Dict[str, List[str]]:
         if not isinstance(members, list):
             continue
         unique_members: List[str] = []
-        seen: Set[str] = set()
+        seen_local: Set[str] = set()
         for m in members:
-            if isinstance(m, str) and m.strip() and m not in seen:
-                unique_members.append(m)
-                seen.add(m)
+            if not isinstance(m, str) or not m.strip():
+                continue
+            norm = _norm_member(m)
+            if norm in seen_local:
+                continue
+            unique_members.append(m)
+            seen_local.add(norm)
         if unique_members:
             cleaned[canonical.strip()] = unique_members
     return cleaned
@@ -332,40 +811,120 @@ def apply_brand_aliases(df: pd.DataFrame, member_to_canonical: Dict[str, str]) -
     return out
 
 
+
+def _read_filter_metadata_cache() -> Dict:
+    """DB 파일 시그니처와 일치하는 시작용 메타데이터 디스크 캐시를 읽는다."""
+    if not FILTER_METADATA_CACHE_PATH.exists():
+        return {}
+    try:
+        payload = json.loads(FILTER_METADATA_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if payload.get("db_signature") != list(_db_signature()):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_filter_metadata_cache(payload: Dict) -> None:
+    """다음 대시보드 실행도 빠르도록 메타데이터 캐시를 원자적으로 저장한다."""
+    try:
+        data = dict(payload)
+        data["db_signature"] = list(_db_signature())
+        tmp_path = FILTER_METADATA_CACHE_PATH.with_name(
+            FILTER_METADATA_CACHE_PATH.name + ".tmp"
+        )
+        tmp_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(FILTER_METADATA_CACHE_PATH)
+    except Exception:
+        # 캐시는 성능 최적화일 뿐이므로 저장 실패가 대시보드를 막아서는 안 된다.
+        pass
+
 @st.cache_data(show_spinner=False)
 def query_brands_by_category(mtime: float) -> Dict[str, List[str]]:
-    """device_category 칼럼이 있는 DB 에서 카테고리별 brand_name 목록을 반환.
-    구 DB(칼럼 없음) 의 경우 빈 dict 를 반환한다 — 카테고리 필터 비활성화 효과.
-    """
+    """카테고리별 브랜드 목록. DB가 그대로면 프로세스 간 디스크 캐시를 재사용한다."""
     _ = mtime
     if not DB_PATH.exists():
         return {}
+
+    cached = _read_filter_metadata_cache()
+    cached_map = cached.get("brands_by_category")
+    if isinstance(cached_map, dict):
+        return {
+            str(cat): [str(v) for v in values]
+            for cat, values in cached_map.items()
+            if isinstance(values, list)
+        }
+
     with _connect() as conn:
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(maude_reports)").fetchall()}
-        if "device_category" not in cols:
-            return {}
-        rows = conn.execute(
-            "SELECT DISTINCT device_category, brand_name "
-            "FROM maude_reports "
-            "WHERE device_category IS NOT NULL AND device_category <> '' "
-            "  AND brand_name IS NOT NULL AND brand_name <> ''"
-        ).fetchall()
+        table_names = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        if "maude_monthly_summary" in table_names:
+            rows = conn.execute(
+                "SELECT DISTINCT device_category, brand_name "
+                "FROM maude_monthly_summary "
+                "WHERE device_category IS NOT NULL AND device_category <> '' "
+                "  AND brand_name IS NOT NULL AND brand_name <> ''"
+            ).fetchall()
+        else:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(maude_reports)").fetchall()}
+            if "device_category" not in cols:
+                return {}
+            rows = conn.execute(
+                "SELECT DISTINCT device_category, brand_name "
+                "FROM maude_reports "
+                "WHERE device_category IS NOT NULL AND device_category <> '' "
+                "  AND brand_name IS NOT NULL AND brand_name <> ''"
+            ).fetchall()
+
     out: Dict[str, List[str]] = {}
     for cat, bn in rows:
-        out.setdefault(cat, []).append(bn)
+        out.setdefault(str(cat), []).append(str(bn))
     for cat in out:
         out[cat].sort()
+
+    payload = _read_filter_metadata_cache()
+    payload["brands_by_category"] = out
+    _write_filter_metadata_cache(payload)
     return out
 
 
 @st.cache_data(show_spinner=False)
 def load_metadata(mtime: float) -> Tuple[List[str], List[str], Optional[date], Optional[date], int]:
-    """필터 위젯 기본값 계산: 브랜드 / event_type / 날짜 범위 / 총건수."""
+    """필터 기본값. DB가 바뀌지 않았으면 이전 실행의 디스크 캐시를 재사용한다."""
+    _ = mtime
     if not DB_PATH.exists():
         return [], [], None, None, 0
+
+    cached = _read_filter_metadata_cache()
+    metadata = cached.get("metadata")
+    if isinstance(metadata, dict):
+        return (
+            [str(v) for v in metadata.get("brands", [])],
+            [str(v) for v in metadata.get("event_types", [])],
+            _parse_iso_date(metadata.get("min_date", "")),
+            _parse_iso_date(metadata.get("max_date", "")),
+            int(metadata.get("total_reports", 0)),
+        )
+
     with _connect() as conn:
+        table_names = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        brand_source = (
+            "maude_monthly_summary"
+            if "maude_monthly_summary" in table_names
+            else "maude_reports"
+        )
         brands = [r[0] for r in conn.execute(
-            "SELECT DISTINCT brand_name FROM maude_reports "
+            f"SELECT DISTINCT brand_name FROM {brand_source} "
             "WHERE brand_name IS NOT NULL AND brand_name <> '' "
             "ORDER BY brand_name"
         )]
@@ -381,7 +940,17 @@ def load_metadata(mtime: float) -> Tuple[List[str], List[str], Optional[date], O
         min_d = _parse_iso_date(row[0]) if row and row[0] else None
         max_d = _parse_iso_date(row[1]) if row and row[1] else None
         total = conn.execute("SELECT COUNT(*) FROM maude_reports").fetchone()[0]
-    return brands, event_types, min_d, max_d, total
+
+    payload = _read_filter_metadata_cache()
+    payload["metadata"] = {
+        "brands": brands,
+        "event_types": event_types,
+        "min_date": min_d.isoformat() if min_d else "",
+        "max_date": max_d.isoformat() if max_d else "",
+        "total_reports": int(total),
+    }
+    _write_filter_metadata_cache(payload)
+    return brands, event_types, min_d, max_d, int(total)
 
 
 def _parse_iso_date(s: str) -> Optional[date]:
@@ -436,11 +1005,11 @@ def _build_where(
                     expanded_brands.append(chosen)
                     seen.add(chosen)
         if len(expanded_brands) == 1:
-            clauses.append("brand_name COLLATE NOCASE = ?")
+            clauses.append("brand_name = ?")
             params.append(expanded_brands[0])
         else:
             placeholders = ",".join(["?"] * len(expanded_brands))
-            clauses.append(f"brand_name COLLATE NOCASE IN ({placeholders})")
+            clauses.append(f"brand_name IN ({placeholders})")
             params.extend(expanded_brands)
 
     if event_types:
@@ -449,64 +1018,91 @@ def _build_where(
         params.extend(event_types)
 
     if date_from:
-        clauses.append("REPLACE(SUBSTR(date_received, 1, 10), '-', '') >= ?")
-        params.append(date_from.strftime("%Y%m%d"))
+        clauses.append("date_received >= ?")
+        params.append(date_from.isoformat())
     if date_to:
-        clauses.append("REPLACE(SUBSTR(date_received, 1, 10), '-', '') <= ?")
-        params.append(date_to.strftime("%Y%m%d"))
+        clauses.append("date_received <= ?")
+        params.append(date_to.isoformat())
 
     if keyword_text:
         like = f"%{keyword_text}%"
-        mdr_key_like = f'%\"mdr_report_key\"%{keyword_text}%'
         available = set(detect_columns(_db_last_modified()))
-        text_clauses = [
-            "event_description LIKE ?",
-            "manufacturer_narrative LIKE ?",
-        ]
-        text_params = [like, like]
-        if "additional_manufacturer_narrative" in available:
-            text_clauses.append("additional_manufacturer_narrative LIKE ?")
-            text_params.append(like)
-        text_clauses.extend([
+        narrow = [
             "summary_complaint_kr LIKE ?",
             "summary_response_kr LIKE ?",
             "patient_problems LIKE ?",
             "product_problems LIKE ?",
             "COALESCE(report_number, '') LIKE ?",
-            "COALESCE(raw_json, '') LIKE ?",
-        ])
-        text_params.extend([like] * 4 + [like, mdr_key_like])
+        ]
+        if USE_V2:
+            # 본문은 FTS 서브쿼리로. raw_json LIKE 는 본문 중복이라 뺀다.
+            fts_clause, fts_params = _fts_subquery(keyword_text)
+            text_clauses = narrow + ["COALESCE(mdr_report_key, '') LIKE ?", fts_clause]
+            text_params = [like] * 5 + [like] + fts_params
+        else:
+            mdr_key_like = f'%\"mdr_report_key\"%{keyword_text}%'
+            text_clauses = [
+                "event_description LIKE ?",
+                "manufacturer_narrative LIKE ?",
+            ]
+            text_params = [like, like]
+            if "additional_manufacturer_narrative" in available:
+                text_clauses.append("additional_manufacturer_narrative LIKE ?")
+                text_params.append(like)
+            text_clauses.extend(narrow + ["COALESCE(raw_json, '') LIKE ?"])
+            text_params.extend([like] * 5 + [mdr_key_like])
         clauses.append("(" + " OR ".join(text_clauses) + ")")
         params.extend(text_params)
     if id_filters:
         per_id_clauses: List[str] = []
         for term in id_filters:
             if _is_number_like_id(term):
-                per_id_clauses.append(
-                    "("
-                    "COALESCE(report_number, '') = ? COLLATE NOCASE OR "
-                    "COALESCE(raw_json, '') LIKE ? OR "
-                    "COALESCE(raw_json, '') LIKE ? OR "
-                    "COALESCE(raw_json, '') LIKE ?"
-                    ")"
-                )
-                params.extend([
-                    term,
-                    f'%\"mdr_report_key\":\"{term}\"%',
-                    f'%\"mdr_report_key\": \"{term}\"%',
-                    f'%\"mdr_report_key\": {term}%',
-                ])
+                resolved_report_number = ""
+                try:
+                    with _connect() as conn:
+                        row = conn.execute(
+                            "SELECT report_number FROM maude_reports WHERE report_number = ? LIMIT 1",
+                            (term,),
+                        ).fetchone()
+                    if row and row[0]:
+                        resolved_report_number = str(row[0]).strip()
+                except Exception:
+                    resolved_report_number = ""
+                if not resolved_report_number:
+                    resolved_report_number = _resolve_report_number_from_mdr_key(term)
+                if resolved_report_number:
+                    clauses.append("report_number = ?")
+                    params.append(resolved_report_number)
+                else:
+                    clauses.append(
+                        "("
+                        "COALESCE(mdr_report_key, '') = ? COLLATE NOCASE OR "
+                        "COALESCE(report_number, '') = ? COLLATE NOCASE"
+                        ")"
+                    )
+                    params.extend([term, term])
             else:
                 like = f"%{term}%"
-                mdr_key_like = f'%\"mdr_report_key\"%{term}%'
-                per_id_clauses.append(
-                    "("
-                    "COALESCE(report_number, '') LIKE ? COLLATE NOCASE OR "
-                    "COALESCE(raw_json, '') LIKE ? COLLATE NOCASE"
-                    ")"
-                )
+                mdr_key_like = like if USE_V2 else f'%\"mdr_report_key\"%{term}%'
+                if USE_V2:
+                    # v2 는 mdr_report_key 가 독립 칼럼이라 raw_json 을
+                    # 문자열로 뒤질 필요가 없다.
+                    per_id_clauses.append(
+                        "("
+                        "COALESCE(report_number, '') LIKE ? COLLATE NOCASE OR "
+                        "COALESCE(mdr_report_key, '') LIKE ? COLLATE NOCASE"
+                        ")"
+                    )
+                else:
+                    per_id_clauses.append(
+                        "("
+                        "COALESCE(report_number, '') LIKE ? COLLATE NOCASE OR "
+                        "COALESCE(raw_json, '') LIKE ? COLLATE NOCASE"
+                        ")"
+                    )
                 params.extend([like, mdr_key_like])
-        clauses.append("(" + " OR ".join(per_id_clauses) + ")")
+        if per_id_clauses:
+            clauses.append("(" + " OR ".join(per_id_clauses) + ")")
 
     if code_filters:
         code_term_map = _code_to_problem_terms(_db_last_modified(), _problem_code_map_mtime())
@@ -536,32 +1132,67 @@ def _build_where(
 
         clauses.append("(" + " OR ".join(per_code_clauses) + ")")
 
-    if report_stage in ("initial", "followup"):
-        pat = "%Initial submission%" if report_stage == "initial" else "%Followup%"
-        available = set(detect_columns(_db_last_modified()))
-        if "type_of_report" in available:
-            clauses.append(
-                "("
-                "COALESCE(type_of_report, '') LIKE ? COLLATE NOCASE "
-                "OR (TRIM(COALESCE(type_of_report, '')) = '' AND COALESCE(raw_json, '') LIKE ? COLLATE NOCASE)"
-                ")"
-            )
-            params.extend([pat, pat])
-        else:
-            # 구 스키마 호환
-            clauses.append("COALESCE(raw_json, '') LIKE ? COLLATE NOCASE")
-            params.append(pat)
+    stage_clause, stage_params = _report_stage_clause(report_stage)
+    if stage_clause:
+        clauses.append(stage_clause)
+        params.extend(stage_params)
 
     where = " AND ".join(clauses) if clauses else "1=1"
     return where, params
 
 
+def _build_where_with_prefilter(
+    brands: List[str],
+    event_types: List[str],
+    date_from: Optional[date],
+    date_to: Optional[date],
+    keyword: str,
+) -> Tuple[str, List, str, List]:
+    """인덱스 친화적인 base WHERE 와 비싼 text WHERE 로 분리."""
+    return _build_filter_components(brands, event_types, date_from, date_to, keyword)
+
+
+def _search_prefilter_select_clause(available: Optional[List[str]] = None) -> str:
+    """텍스트 검색 WHERE 에서 참조하는 칼럼만 뽑는 SELECT 절."""
+    # 호출부가 칼럼 목록을 생략해도 실제 DB 스키마를 사용한다. 예전에는 빈
+    # 목록으로 처리되어 additional_manufacturer_narrative 가 CTE SELECT 에서
+    # 빠졌지만, 바깥 WHERE 에서는 참조되어 "no such column" 오류가 발생했다.
+    if available is None:
+        available = detect_columns(_db_last_modified())
+    available_set = set(available)
+    if USE_V2:
+        # v2 의 텍스트 WHERE 는 본문을 FTS 서브쿼리로 참조하므로, CTE 에서
+        # 본문/raw_json 을 끌어올 필요가 없다. 이것이 조회가 빨라지는 핵심이다.
+        return ", ".join([
+            "report_number",
+            "mdr_report_key",
+            "summary_complaint_kr",
+            "summary_response_kr",
+            "patient_problems",
+            "product_problems",
+        ])
+    cols = [
+        "report_number",
+        "raw_json",
+        "event_description",
+        "manufacturer_narrative",
+        "summary_complaint_kr",
+        "summary_response_kr",
+        "patient_problems",
+        "product_problems",
+    ]
+    if "additional_manufacturer_narrative" in available_set:
+        cols.append("additional_manufacturer_narrative")
+    return ", ".join(cols)
+
+
 # 메인 테이블 표시용 칼럼 정의: (SQL 식별자, 엑셀/표 라벨)
 #   - 실제 DB 에 칼럼이 없으면 NULL 로 자동 대체됨.
 _REPORT_COLS: List[Tuple[str, str]] = [
-    ("report_number",          "MAUDE 번호"),
+    ("mdr_report_key",         "MDR Report Key"),
+    ("report_number",          "Report Number"),
     ("event_type",             "EVENT_TYPE"),
-    ("type_of_report",         "REPORT_STAGE"),
+    ("type_of_report",         "Type of Report"),
     ("date_received",          "DATE_RECEIVED"),
     ("date_report",            "DATE_REPORT"),
     ("date_of_event",          "DATE_OF_EVENT"),
@@ -585,7 +1216,50 @@ _REPORT_COLS: List[Tuple[str, str]] = [
 ]
 
 
+_REPORT_PREVIEW_COLS: List[Tuple[str, str]] = [
+    ("mdr_report_key",         "MDR Report Key"),
+    ("report_number",          "Report Number"),
+    ("event_type",             "EVENT_TYPE"),
+    ("type_of_report",         "Type of Report"),
+    ("date_received",          "DATE_RECEIVED"),
+    ("date_report",            "DATE_REPORT"),
+    ("date_of_event",          "DATE_OF_EVENT"),
+    ("brand_name",             "BRAND_NAME"),
+    ("device_category",        "DEVICE_CATEGORY"),
+    ("manufacturer_name",      "MANUFACTURER"),
+    ("manufacturer_country",   "COUNTRY"),
+    ("patient_sex",            "SEX"),
+    ("patient_age",            "AGE"),
+    ("patient_race",           "RACE"),
+    ("patient_ethnicity",      "ETHNICITY"),
+    ("patient_problems",       "HEALTH_EFFECT_CLINICAL_CODE"),
+    ("product_problems",       "MEDICAL_DEVICE_PROBLEM_CODE"),
+    ("summary_complaint_kr",   "[요약] 소비자 불만"),
+    ("summary_response_kr",    "[요약] 제조사 대응"),
+    ("summary_conclusion_kr",  "[요약] 결론"),
+]
+
+
 @st.cache_data(show_spinner=False)
+# v2 에서 본문 텍스트는 maude_reports_text 에 있다. 표시용 질의는 LIMIT 이
+# 걸린 소량만 다루므로 조인 비용이 사실상 없다. 반면 필터/집계 질의는 좁은
+# 테이블만 건드리게 두는 것이 핵심이라 여기서만 조인한다.
+def _report_from_clause() -> str:
+    if USE_V2:
+        return "maude_reports LEFT JOIN maude_reports_text USING(report_number)"
+    return "maude_reports"
+
+
+def _report_col_expr(col: str, available: Set[str]) -> str:
+    """표시용 SELECT 에서 쓸 칼럼식. 없는 칼럼은 NULL 로 대체한다."""
+    if USE_V2 and col == "raw_json":
+        # v2 는 raw_json 을 압축해 별도 테이블에 둔다. 목록에서 이 값을 쓰던
+        # 이유는 mdr_report_key 와 additional_manufacturer_narrative 를
+        # 뽑아내기 위해서였는데, 둘 다 v2 에는 독립 칼럼으로 존재한다.
+        return "NULL"
+    return col if col in available else "NULL"
+
+
 def query_reports(
     mtime: float,
     brands: List[str],
@@ -594,29 +1268,63 @@ def query_reports(
     date_to: Optional[date],
     keyword: str,
     limit: int = 5000,
+    preview: bool = False,
 ) -> pd.DataFrame:
     """필터 적용된 리포트 DataFrame 반환 (최대 limit 건).
     DB 에 없는 칼럼은 NULL 로 대체하여, 구 버전 DB 에서도 동작한다.
     """
     available = detect_columns(mtime)
-    where, params = _build_where(brands, event_types, date_from, date_to, keyword)
+    base_clauses, base_params, text_clauses, text_params = _build_where_with_prefilter(
+        brands, event_types, date_from, date_to, keyword
+    )
+    base_where = " AND ".join(base_clauses) if base_clauses else "1=1"
+    text_where = " AND ".join(text_clauses) if text_clauses else "1=1"
+    query_params = list(base_params) + list(text_params)
+
+    # EVENT_TYPE 조건이 있으면 작은 event_type 인덱스에서 rowid를 먼저 얻는다.
+    # 그렇지 않으면 SQLite가 brand/date 인덱스를 골라 큰 TEXT 칼럼을 가진 후보를
+    # 대량으로 읽을 수 있어, 실제 결과가 적어도 표 조회가 매우 느려진다.
+    if event_types and not USE_V2:
+        # v1 은 행이 두꺼워서 계획기가 brand/date 인덱스를 고르면 큰 TEXT 를
+        # 대량으로 읽어 표 조회가 매우 느려졌다. 그래서 작은 event_type
+        # 인덱스에서 rowid 를 먼저 얻도록 강제했다. v2 는 행이 얇고 커버링
+        # 인덱스가 있어 힌트가 불필요하며, 그 이름의 인덱스도 없다.
+        event_placeholders = ",".join(["?"] * len(event_types))
+        base_where = (
+            "rowid IN ("
+            "SELECT rowid FROM maude_reports INDEXED BY idx_event_type "
+            f"WHERE event_type IN ({event_placeholders})"
+            f") AND ({base_where})"
+        )
+        query_params = list(event_types) + query_params
+    cols = _REPORT_PREVIEW_COLS if preview else _REPORT_COLS
+    available_set = set(available)
     select_parts = []
-    for col, label in _REPORT_COLS:
-        expr = col if col in available else "NULL"
+    for col, label in cols:
+        expr = _report_col_expr(col, available_set)
         # label 은 한글/공백 포함이므로 작은따옴표 대신 큰따옴표로 묶음
         select_parts.append(f'{expr} AS "{label}"')
     select_clause = ",\n            ".join(select_parts)
     sql = f"""
-        SELECT
-            {select_clause}
-        FROM maude_reports
-        WHERE {where}
-        ORDER BY date_received DESC, report_number DESC
+        WITH base AS (
+            SELECT
+                {select_clause}
+            FROM {_report_from_clause()}
+            WHERE {base_where}
+        )
+        SELECT *
+        FROM base
+        WHERE {text_where}
+        ORDER BY "DATE_RECEIVED" DESC, "Report Number" DESC
         LIMIT {int(limit)}
     """
     with _connect() as conn:
-        df = pd.read_sql_query(sql, conn, params=params)
+        df = pd.read_sql_query(sql, conn, params=query_params)
     if "__RAW_JSON" in df.columns:
+        if "MDR Report Key" in df.columns:
+            extracted_key = df["__RAW_JSON"].apply(_extract_mdr_report_key)
+            missing_key = df["MDR Report Key"].isna() | (df["MDR Report Key"].astype(str).str.strip() == "")
+            df.loc[missing_key, "MDR Report Key"] = extracted_key[missing_key]
         def _extract_additional(raw: Optional[str]) -> str:
             if not isinstance(raw, str) or "Manufacturer" not in raw:
                 return ""
@@ -632,7 +1340,111 @@ def query_reports(
         df = df.drop(columns=["__RAW_JSON"])
     elif "ADDITIONAL_MANUFACTURER_NARRATIVE (원문)" not in df.columns:
         df["ADDITIONAL_MANUFACTURER_NARRATIVE (원문)"] = ""
-    return format_problem_columns(apply_brand_aliases(df, MEMBER_TO_CANONICAL))
+    df = apply_brand_aliases(df, MEMBER_TO_CANONICAL)
+    # 화면 미리보기는 DB에 저장된 문제 코드 문자열을 그대로 사용한다. 여기서
+    # format_problem_columns()를 호출하면 최초 실행 시 8.7GB DB 전체를 스캔하는
+    # 코드 매핑 추론이 발생해, 100여 행 표도 수백 초 기다리게 된다.
+    return df if preview else format_problem_columns(df)
+
+
+@st.cache_data(show_spinner=False)
+def query_report_detail(mtime: float, report_number: str) -> Optional[pd.Series]:
+    """단일 보고서의 상세 원문/메타데이터를 지연 로드한다."""
+    _ = mtime
+    if not report_number:
+        return None
+    available = detect_columns(mtime)
+    available_set = set(available)
+    select_parts = []
+    for col, label in _REPORT_COLS:
+        expr = _report_col_expr(col, available_set)
+        select_parts.append(f'{expr} AS "{label}"')
+    select_clause = ",\n            ".join(select_parts)
+    sql = f"""
+        SELECT
+            {select_clause}
+        FROM {_report_from_clause()}
+        WHERE report_number = ?
+        LIMIT 1
+    """
+    with _connect() as conn:
+        df = pd.read_sql_query(sql, conn, params=(str(report_number),))
+    if df.empty:
+        return None
+    if "__RAW_JSON" not in df.columns:
+        df["__RAW_JSON"] = ""
+    return df.iloc[0]
+
+
+# 정확 건수 계산에 허용할 시간(초). 이 안에 못 끝내면 상한 집계로 물러난다.
+#
+# 배경: brand_name + device_category + date_received 를 함께 거는 필터는 현재
+# 스키마에 커버링 인덱스가 없어서, 인덱스로 후보를 찾은 뒤 device_category 한
+# 칼럼을 읽으려고 행 전체(약 10.9KB, 절반이 raw_json)를 디스크에서 가져온다.
+# 실측에서 317,697건 COUNT 에 5,770초가 걸렸다. 아래 인덱스를 만들면 해소된다:
+#   CREATE INDEX idx_reports_cat_brand_date
+#       ON maude_reports(device_category, brand_name, date_received);
+COUNT_TIME_BUDGET_SEC = 20.0
+COUNT_FALLBACK_CAP = 20000
+
+
+def _count_with_budget(
+    sql: str, params: List, budget_sec: float
+) -> Optional[int]:
+    """budget_sec 안에 COUNT 를 못 끝내면 질의를 중단하고 None 을 돌려준다."""
+    deadline = time.perf_counter() + budget_sec
+    conn = _connect()
+    try:
+        # 두 번째 인자는 콜백을 부르기 전에 실행할 VM 명령 수다. 너무 크면
+        # 예산을 한참 넘겨서야 중단된다. 실측(예산 3초): 20000 이면 22.7초,
+        # 1000 이면 3.7초에 멈췄다. 콜백 자체는 가벼워 오버헤드는 무시할 만하다.
+        conn.set_progress_handler(
+            lambda: 1 if time.perf_counter() > deadline else 0, 1000
+        )
+        return int(conn.execute(sql, params).fetchone()[0])
+    except sqlite3.OperationalError:
+        # 진행 핸들러가 질의를 취소한 경우(또는 그 밖의 실행 오류)
+        return None
+    finally:
+        try:
+            conn.set_progress_handler(None, 0)
+        except Exception:  # noqa: BLE001
+            pass
+        conn.close()
+
+
+def _filtered_count_sql(
+    brands: List[str],
+    event_types: List[str],
+    date_from: Optional[date],
+    date_to: Optional[date],
+    keyword: str,
+    cap: Optional[int] = None,
+) -> Tuple[str, List]:
+    """필터 건수 SQL 을 만든다. cap 을 주면 그 수에서 세기를 멈춘다."""
+    base_clauses, base_params, text_clauses, text_params = _build_where_with_prefilter(
+        brands, event_types, date_from, date_to, keyword
+    )
+    base_where = " AND ".join(base_clauses) if base_clauses else "1=1"
+    text_where = " AND ".join(text_clauses) if text_clauses else "1=1"
+    limit_sql = f" LIMIT {int(cap)}" if cap else ""
+    if not text_clauses:
+        return (
+            f"SELECT COUNT(*) FROM ("
+            f"SELECT 1 FROM maude_reports WHERE {base_where}{limit_sql})",
+            base_params,
+        )
+    return (
+        f"""
+        WITH base AS (
+            SELECT {_search_prefilter_select_clause()}
+            FROM maude_reports
+            WHERE {base_where}{limit_sql}
+        )
+        SELECT COUNT(*) FROM base WHERE {text_where}
+        """,
+        base_params + text_params,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -643,12 +1455,20 @@ def query_filtered_count(
     date_from: Optional[date],
     date_to: Optional[date],
     keyword: str,
-) -> int:
-    where, params = _build_where(brands, event_types, date_from, date_to, keyword)
-    with _connect() as conn:
-        return conn.execute(
-            f"SELECT COUNT(*) FROM maude_reports WHERE {where}", params
-        ).fetchone()[0]
+) -> Tuple[Optional[int], bool]:
+    """(건수, 정확여부) 를 돌려준다.
+
+    정확 집계가 시간 예산을 넘기면 상한 집계로 물러나고 exact=False 가 된다.
+    """
+    sql, params = _filtered_count_sql(brands, event_types, date_from, date_to, keyword)
+    exact = _count_with_budget(sql, params, COUNT_TIME_BUDGET_SEC)
+    if exact is not None:
+        return exact, True
+    sql, params = _filtered_count_sql(
+        brands, event_types, date_from, date_to, keyword, cap=COUNT_FALLBACK_CAP
+    )
+    capped = _count_with_budget(sql, params, COUNT_TIME_BUDGET_SEC)
+    return capped, False
 
 
 @st.cache_data(show_spinner=False)
@@ -661,35 +1481,26 @@ def query_has_match(
     keyword: str,
 ) -> bool:
     """필터 결과 존재 여부만 빠르게 확인 (0건 판정용)."""
-    where, params = _build_where(brands, event_types, date_from, date_to, keyword)
-    sql = f"SELECT 1 FROM maude_reports WHERE {where} LIMIT 1"
-    with _connect() as conn:
-        row = conn.execute(sql, params).fetchone()
-    return row is not None
-
-
-@st.cache_data(show_spinner=False)
-def query_filtered_count_capped(
-    mtime: float,
-    brands: List[str],
-    event_types: List[str],
-    date_from: Optional[date],
-    date_to: Optional[date],
-    keyword: str,
-    cap: int = 20000,
-) -> int:
-    """상단 KPI 표시용 빠른 건수(최대 cap까지만 계산)."""
-    where, params = _build_where(brands, event_types, date_from, date_to, keyword)
+    base_clauses, base_params, text_clauses, text_params = _build_where_with_prefilter(
+        brands, event_types, date_from, date_to, keyword
+    )
+    base_where = " AND ".join(base_clauses) if base_clauses else "1=1"
+    text_where = " AND ".join(text_clauses) if text_clauses else "1=1"
+    if not text_clauses:
+        sql = f"SELECT 1 FROM maude_reports WHERE {base_where} LIMIT 1"
+        with _connect() as conn:
+            return conn.execute(sql, base_params).fetchone() is not None
     sql = f"""
-        SELECT COUNT(*) FROM (
-            SELECT 1
+        WITH base AS (
+            SELECT {_search_prefilter_select_clause()}
             FROM maude_reports
-            WHERE {where}
-            LIMIT {int(cap)}
+            WHERE {base_where}
         )
+        SELECT 1 FROM base WHERE {text_where} LIMIT 1
     """
     with _connect() as conn:
-        return int(conn.execute(sql, params).fetchone()[0])
+        row = conn.execute(sql, base_params + text_params).fetchone()
+    return row is not None
 
 
 def _join_narrative_parts_for_display(parts: List[str]) -> str:
@@ -749,19 +1560,139 @@ def _extract_narrative_sections(raw_json: Optional[str]) -> Dict[str, str]:
     return out
 
 
+def _extract_mdr_report_key(raw_json: Optional[str]) -> str:
+    """raw_json 에서 MDR Report Key 를 추출한다."""
+    if not raw_json:
+        return ""
+    try:
+        payload = json.loads(raw_json)
+    except Exception:
+        return ""
+    return str(payload.get("mdr_report_key") or "").strip()
+
+
+@st.cache_data(show_spinner=False)
+def _resolve_report_number_from_mdr_key(mdr_report_key: str) -> str:
+    """openFDA 에서 MDR Report Key -> Report Number 를 한 번만 조회해 캐시한다."""
+    key = str(mdr_report_key or "").strip()
+    if not key:
+        return ""
+    try:
+        resp = requests.get(
+            "https://api.fda.gov/device/event.json",
+            params={"search": f"mdr_report_key:{key}", "limit": 1},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        results = payload.get("results") or []
+        if results and isinstance(results[0], dict):
+            return str(results[0].get("report_number") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _normalize_date_text(value: object) -> str:
+    """openFDA 날짜 문자열을 사람이 보기 쉬운 형식으로 정리한다."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) == 8 and text.isdigit():
+        return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+    return text
+
+
+def _extract_report_metadata(raw_json: Optional[str]) -> Dict[str, str]:
+    """원문 payload 에서 웹 상세 페이지에 대응하는 메타데이터를 뽑는다."""
+    out = {
+        "mdr_report_key": "",
+        "report_number": "",
+        "type_of_report": "",
+        "report_status": "",
+        "followup_count": "0",
+        "report_date_section_b": "",
+        "initial_date_received_by_manufacturer": "",
+        "initial_report_fda_received_date": "",
+    }
+    if not raw_json:
+        return out
+    try:
+        payload = json.loads(raw_json)
+    except Exception:
+        return out
+    if not isinstance(payload, dict):
+        return out
+
+    out["mdr_report_key"] = str(payload.get("mdr_report_key") or "").strip()
+    out["report_number"] = str(payload.get("report_number") or "").strip()
+
+    type_val = payload.get("type_of_report")
+    if isinstance(type_val, list):
+        type_text = ", ".join(str(v).strip() for v in type_val if str(v or "").strip())
+    else:
+        type_text = str(type_val or "").strip()
+    out["type_of_report"] = type_text
+
+    followup_count = len(re.findall(r"follow[- ]?up", type_text, flags=re.I))
+    out["followup_count"] = str(followup_count)
+    if re.search(r"initial", type_text, flags=re.I):
+        out["report_status"] = "초기 보고" if followup_count == 0 else "초기 보고 + 후속 수정"
+    elif followup_count > 0:
+        out["report_status"] = "후속 수정"
+    elif type_text:
+        out["report_status"] = type_text
+
+    out["report_date_section_b"] = _normalize_date_text(
+        payload.get("date_report") or payload.get("report_date") or payload.get("date_report_to_fda")
+    )
+    out["initial_date_received_by_manufacturer"] = _normalize_date_text(
+        payload.get("date_manufacturer_received") or payload.get("date_report_to_manufacturer")
+    )
+    out["initial_report_fda_received_date"] = _normalize_date_text(payload.get("date_received"))
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_raw_json(mtime: float, report_number: str) -> Optional[str]:
+    """단건 raw_json 원문을 돌려준다.
+
+    v2 는 raw_json 을 zlib 으로 압축해 maude_reports_raw 에 따로 담는다.
+    필터/집계 질의가 이 큰 값을 건드리지 않게 하는 것이 v2 의 핵심이라,
+    상세 화면에서 필요한 1건만 여기서 풀어 쓴다.
+    """
+    _ = mtime
+    if not report_number:
+        return None
+    try:
+        with _connect() as conn:
+            if USE_V2:
+                row = conn.execute(
+                    "SELECT raw_json_z FROM maude_reports_raw "
+                    "WHERE report_number = ? LIMIT 1",
+                    (str(report_number),),
+                ).fetchone()
+                if not row or row[0] is None:
+                    return None
+                return zlib.decompress(row[0]).decode("utf-8")
+            row = conn.execute(
+                "SELECT raw_json FROM maude_reports WHERE report_number = ? LIMIT 1",
+                (str(report_number),),
+            ).fetchone()
+            return row[0] if row else None
+    except (sqlite3.Error, zlib.error, UnicodeDecodeError):
+        return None
+
+
 def _fetch_fda_detail_narrative(report_number: str) -> Dict[str, str]:
     """FDA AccessData detail page에서 원문 narrative를 보조적으로 추출한다."""
     if not report_number:
         return {"event_description": "", "manufacturer_narrative": "", "additional_manufacturer_narrative": ""}
     try:
-        with _connect() as conn:
-            row = conn.execute(
-                "SELECT raw_json FROM maude_reports WHERE report_number = ? LIMIT 1",
-                (str(report_number),),
-            ).fetchone()
-        if not row or not row[0]:
+        raw = load_raw_json(_db_last_modified(), str(report_number))
+        if not raw:
             return {"event_description": "", "manufacturer_narrative": "", "additional_manufacturer_narrative": ""}
-        payload = json.loads(row[0])
+        payload = json.loads(raw)
         mdr_report_key = str(payload.get("mdr_report_key") or "").strip()
         device = (payload.get("device") or [{}])[0] if isinstance(payload.get("device"), list) and payload.get("device") else {}
         pc = str(device.get("device_report_product_code") or "").strip()
@@ -801,14 +1732,16 @@ def query_report_narrative_sections(mtime: float, report_number: str) -> Dict[st
         return _extract_narrative_sections(None)
     available = set(detect_columns(mtime))
     additional_expr = "additional_manufacturer_narrative" if "additional_manufacturer_narrative" in available else "NULL"
+    table = "maude_reports_text" if USE_V2 else "maude_reports"
     with _connect() as conn:
         row = conn.execute(
-            f"SELECT event_description, manufacturer_narrative, {additional_expr}, raw_json FROM maude_reports WHERE report_number = ? LIMIT 1",
+            f"SELECT event_description, manufacturer_narrative, {additional_expr} "
+            f"FROM {table} WHERE report_number = ? LIMIT 1",
             (str(report_number),),
         ).fetchone()
     if not row:
         return _extract_narrative_sections(None)
-    raw_json = row[3]
+    raw_json = load_raw_json(mtime, str(report_number))
     out = _extract_narrative_sections(raw_json)
     if not out.get("event_description"):
         out["event_description"] = row[0] or ""
@@ -816,14 +1749,6 @@ def query_report_narrative_sections(mtime: float, report_number: str) -> Dict[st
         out["manufacturer_narrative"] = row[1] or ""
     if not out.get("additional_manufacturer_narrative"):
         out["additional_manufacturer_narrative"] = row[2] or ""
-    if not out.get("event_description") or not out.get("manufacturer_narrative") or not out.get("additional_manufacturer_narrative"):
-        fda = _fetch_fda_detail_narrative(report_number)
-        if not out.get("event_description") and fda.get("event_description"):
-            out["event_description"] = fda["event_description"]
-        if not out.get("manufacturer_narrative") and fda.get("manufacturer_narrative"):
-            out["manufacturer_narrative"] = fda["manufacturer_narrative"]
-        if not out.get("additional_manufacturer_narrative") and fda.get("additional_manufacturer_narrative"):
-            out["additional_manufacturer_narrative"] = fda["additional_manufacturer_narrative"]
     return out
 
 
@@ -853,6 +1778,21 @@ def _render_report_narratives(mtime: float, report_number: str, row: Optional[ob
         value = sections.get(section_key) or _row_value(row, label) or "(없음)"
         with st.expander(label):
             st.text(value)
+    missing = [key for key, _ in narrative_fields if not sections.get(key)]
+    if missing and report_number:
+        st.caption("DB에 없는 원문은 필요할 때만 FDA 상세 페이지에서 조회할 수 있습니다.")
+        if st.button("FDA에서 누락 원문 조회", key=f"fetch_fda_narrative_{report_number}"):
+            with st.spinner("FDA 상세 페이지 조회 중..."):
+                fda_sections = _fetch_fda_detail_narrative(str(report_number))
+            found = False
+            for section_key, label in narrative_fields:
+                value = fda_sections.get(section_key, "")
+                if value and not sections.get(section_key):
+                    found = True
+                    st.markdown(f"**{label} — FDA 조회 결과**")
+                    st.text(value)
+            if not found:
+                st.info("FDA 상세 페이지에서도 추가 원문을 찾지 못했습니다.")
 
 
 @st.cache_data(show_spinner=False)
@@ -941,8 +1881,13 @@ def _monthly_top_codes_table(
     domain: str,
     top_n: int = 20,
 ) -> pd.DataFrame:
+    """월별 코드 집계표를 wide format 으로 반환.
+
+    행은 월, 열은 전체 기간 기준 상위 `top_n` 코드가 되도록 만들어
+    월간 비교가 쉽도록 한다.
+    """
     if df is None or df.empty or code_col not in df.columns or "월" not in df.columns:
-        return pd.DataFrame(columns=["월", "순위", label, "건수"])
+        return pd.DataFrame(columns=["월"])
     rows: List[Dict[str, object]] = []
     for month, raw in zip(df["월"], df[code_col]):
         for token in _split_problem_terms(raw):
@@ -950,16 +1895,23 @@ def _monthly_top_codes_table(
             if formatted:
                 rows.append({"월": month, label: formatted})
     if not rows:
-        return pd.DataFrame(columns=["월", "순위", label, "건수"])
-    counts = (
-        pd.DataFrame(rows)
-        .groupby(["월", label], as_index=False)
-        .size()
-        .rename(columns={"size": "건수"})
-        .sort_values(["월", "건수", label], ascending=[True, False, True])
+        return pd.DataFrame(columns=["월"])
+
+    counts = pd.DataFrame(rows).groupby(["월", label], as_index=False).size().rename(columns={"size": "건수"})
+    top_codes = (
+        counts.groupby(label)["건수"].sum().sort_values(ascending=False).head(int(top_n)).index.tolist()
     )
-    counts["순위"] = counts.groupby("월")["건수"].rank(method="first", ascending=False).astype(int)
-    return counts[counts["순위"] <= int(top_n)][["월", "순위", label, "건수"]]
+    pivot = counts[counts[label].isin(top_codes)].pivot_table(
+        index="월",
+        columns=label,
+        values="건수",
+        aggfunc="sum",
+        fill_value=0,
+    )
+    pivot = pivot.reindex(columns=top_codes, fill_value=0)
+    pivot = pivot.sort_index()
+    pivot.index.name = "월"
+    return pivot.reset_index()
 
 
 def _health_device_pair_frames(
@@ -1351,15 +2303,14 @@ def load_annex_code_map(mtime: float) -> Dict[str, object]:
 
 @st.cache_data(show_spinner=False)
 def merged_problem_code_map(db_mtime: float, map_mtime: float) -> Dict[str, Dict[str, str]]:
-    """DB 자동 추론 + 수동 JSON 매핑 + Annex 사전 병합. 수동 > Annex > 자동 추론."""
-    inferred = infer_problem_code_map_from_db(db_mtime)
+    """수동 JSON 매핑 + Annex 사전 병합. 화면 요청 중 DB 전수 추론은 하지 않는다."""
+    _ = db_mtime
     manual = load_problem_code_map(map_mtime)
     annex = load_annex_code_map(_annex_xlsx_mtime())
     annex_domain = annex.get("by_domain", {}) if isinstance(annex, dict) else {}
 
     merged: Dict[str, Dict[str, str]] = {"common": {}, "patient": {}, "device": {}}
     for scope in ("common", "patient", "device"):
-        merged[scope].update(inferred.get(scope, {}))
         merged[scope].update(annex_domain.get(scope, {}))
         merged[scope].update(manual.get(scope, {}))
     return merged
@@ -1417,6 +2368,21 @@ def format_problem_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+_ANNEX_COMMA_TERMS_MEMORY_CACHE: Dict[float, List[str]] = {}
+
+
+def _annex_comma_terms_cached(mtime: float) -> List[str]:
+    """Streamlit 캐시 역직렬화를 행마다 반복하지 않도록 프로세스 메모리에 보관."""
+    cached = _ANNEX_COMMA_TERMS_MEMORY_CACHE.get(mtime)
+    if cached is not None:
+        return cached
+    annex = load_annex_code_map(mtime)
+    terms = list(annex.get("all_terms_with_comma", [])) if isinstance(annex, dict) else []
+    _ANNEX_COMMA_TERMS_MEMORY_CACHE.clear()
+    _ANNEX_COMMA_TERMS_MEMORY_CACHE[mtime] = terms
+    return terms
+
+
 def _split_problem_terms(s: str) -> List[str]:
     """문제 코드 문자열 분리.
 
@@ -1445,10 +2411,7 @@ def _split_problem_terms(s: str) -> List[str]:
     # DB 표기 호환: openFDA가 항목을 쉼표로 join 하므로, 이름 자체에 쉼표가
     # 들어간 Annex 용어("Incorrect, Inadequate ..." 등)는 split 전에 보호한다.
     # Annex Excel 에 등재된 모든 쉼표 포함 용어를 자동 수집 (긴 표현 우선).
-    annex = load_annex_code_map(_annex_xlsx_mtime())
-    annex_comma_terms = (
-        annex.get("all_terms_with_comma", []) if isinstance(annex, dict) else []
-    )
+    annex_comma_terms = _annex_comma_terms_cached(_annex_xlsx_mtime())
     fallback_phrases = [
         "Incorrect, Inadequate or Imprecise Result or Readings",
         "Appropriate Clinical Signs, Symptoms, Conditions Term / Code Not Available",
@@ -1489,6 +2452,7 @@ def query_severe_reports(
     keyword: str,
     severity_types: Tuple[str, ...] = ("Death", "Injury"),
     limit: int = 5000,
+    preview: bool = False,
 ) -> pd.DataFrame:
     """심각 보고(기본: Death+Injury)만 필터된 주요 칼럼 로드.
     event_types 필터는 여기서 고정하므로 사이드바의 EVENT_TYPE 필터는 무시됨 (§1 특성).
@@ -1500,7 +2464,7 @@ def query_severe_reports(
                patient_problems, product_problems,
                summary_complaint_kr, summary_conclusion_kr,
                event_description
-        FROM maude_reports
+        FROM {_report_from_clause()}
         WHERE {where}
         ORDER BY date_received DESC, report_number DESC
         LIMIT {int(limit)}
@@ -1736,7 +2700,7 @@ def query_investigation_density(
     sql = f"""
         SELECT SUBSTR(REPLACE(date_received, '-', ''), 1, 4) || '-' || SUBSTR(REPLACE(date_received, '-', ''), 5, 2) AS month,
                manufacturer_narrative
-        FROM maude_reports
+        FROM {_report_from_clause()}
         WHERE {where} AND date_received IS NOT NULL AND date_received <> ''
     """
     with _connect() as conn:
@@ -1925,7 +2889,7 @@ def query_hcp_reports(
                patient_problems, product_problems,
                summary_complaint_kr, summary_conclusion_kr,
                event_description
-        FROM maude_reports
+        FROM {_report_from_clause()}
         WHERE {where} AND {hcp_filter}
         ORDER BY date_received DESC, report_number DESC
         LIMIT {int(limit)}
@@ -1963,7 +2927,7 @@ def query_code_matches(
                patient_problems, product_problems,
                summary_complaint_kr, summary_conclusion_kr,
                event_description
-        FROM maude_reports
+        FROM {_report_from_clause()}
         WHERE {where} AND {col} LIKE ?
         ORDER BY date_received DESC
         LIMIT {int(limit)}
@@ -2074,6 +3038,7 @@ def _build_smoothed_line_chart(
     y_cols: List[str],
     title: str,
     legend_orient: Optional[str] = None,
+    series_colors: Optional[List[str]] = None,
 ) -> alt.Chart:
     """원시 선과 이동평균 스무딩 선을 함께 보여주는 Altair 차트."""
     if df is None or df.empty or x_col not in df.columns or not y_cols:
@@ -2107,7 +3072,8 @@ def _build_smoothed_line_chart(
         color=alt.Color(
             "series:N",
             title="시리즈",
-            scale=alt.Scale(domain=y_cols),
+            scale=alt.Scale(domain=y_cols, range=series_colors)
+            if series_colors else alt.Scale(domain=y_cols),
             legend=alt.Legend(orient=legend_orient) if legend_orient else alt.Legend(title="시리즈"),
         ),
         tooltip=[
@@ -2117,13 +3083,35 @@ def _build_smoothed_line_chart(
             alt.Tooltip("value:Q", title="값"),
         ],
     )
-    raw_line = base.transform_filter(alt.datum.kind == "raw").mark_line(point=True)
+    raw_line = base.transform_filter(alt.datum.kind == "raw").mark_line()
     smooth_line = base.transform_filter(alt.datum.kind == "smooth").mark_line(
         strokeDash=[6, 4],
         strokeWidth=3,
         opacity=0.9,
     )
-    return raw_line + smooth_line
+    # hover 용 데이터: 각 시점의 원본 점에 마우스를 올리면 그 월의 모든 시리즈 값을
+    # 한 번에 보여주기 위해, long 형태의 원본 점에 wide 값을 붙여 둔다.
+    hover_df = melted.merge(plot, on=x_col, how="left", suffixes=("", "_wide"))
+    hover_tooltips = [
+        alt.Tooltip(f"{x_col}:O", title="월"),
+        alt.Tooltip("series:N", title="시리즈"),
+        alt.Tooltip("value:Q", title="값", format=".0f"),
+    ]
+    for col in y_cols:
+        if col in plot.columns:
+            hover_tooltips.append(alt.Tooltip(f"{col}:Q", title=str(col), format=".0f"))
+
+    hover_layer = (
+        alt.Chart(hover_df)
+        .mark_circle(opacity=0, size=150)
+        .encode(
+            x=alt.X(f"{x_col}:O", title="월"),
+            y=alt.Y("value:Q", title=title),
+            tooltip=hover_tooltips,
+        )
+    )
+
+    return raw_line + smooth_line + hover_layer
 
 
 def _legend_orient_from_label(label: str) -> Optional[str]:
@@ -2163,7 +3151,7 @@ def _brand_month_line_chart(
     plot["브랜드"] = plot["브랜드"].astype(str)
 
     legend = _brand_legend_encoding(legend_orient, title="브랜드")
-    color = alt.Color("브랜드:N", scale=alt.Scale(domain=brand_order), legend=legend)
+    color = alt.Color("브랜드:N", scale=_brand_color_scale(brand_order), legend=legend)
     x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
 
     line = alt.Chart(plot).mark_line(point=True).encode(
@@ -2206,7 +3194,7 @@ def _brand_month_bar_chart(
     plot["브랜드"] = plot["브랜드"].astype(str)
 
     legend = _brand_legend_encoding(legend_orient, title="브랜드")
-    color = alt.Color("브랜드:N", scale=alt.Scale(domain=brand_order), legend=legend)
+    color = alt.Color("브랜드:N", scale=_brand_color_scale(brand_order), legend=legend)
     x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
 
     chart = alt.Chart(plot).mark_bar().encode(
@@ -2238,9 +3226,11 @@ def _brand_month_share_chart(
     plot["월"] = plot["월"].astype(str)
     plot["건수"] = pd.to_numeric(plot["건수"], errors="coerce").fillna(0)
     plot["브랜드"] = plot["브랜드"].astype(str)
+    brand_rank = {brand: rank for rank, brand in enumerate(brand_order)}
+    plot["브랜드순서"] = plot["브랜드"].map(brand_rank).fillna(len(brand_order))
 
     legend = _brand_legend_encoding(legend_orient, title="브랜드")
-    color = alt.Color("브랜드:N", scale=alt.Scale(domain=brand_order), legend=legend)
+    color = alt.Color("브랜드:N", scale=_brand_color_scale(brand_order), legend=legend)
     x_field = alt.X("월:O", title="월", axis=alt.Axis(labelAngle=-45))
 
     chart = (
@@ -2262,6 +3252,7 @@ def _brand_month_share_chart(
                 axis=alt.Axis(format=".0%"),
             ),
             color=color,
+            order=alt.Order("브랜드순서:Q", sort="ascending"),
             tooltip=[
                 alt.Tooltip("월:O", title="월"),
                 alt.Tooltip("브랜드:N", title="브랜드"),
@@ -2351,7 +3342,7 @@ def generate_insight_report(
         ["키워드", keyword_text or "(없음)"],
         ["Report/MDR ID", ", ".join(id_filters) if id_filters else "(없음)"],
         ["문제 코드 번호", ", ".join(code_filters) if code_filters else "(없음)"],
-        ["MDR 보고 구분", "초기 보고" if report_stage == "initial" else ("후속 수정" if report_stage == "followup" else "(전체)")],
+        ["Type of Report", _report_stage_display(report_stage)],
         ["최근 윈도우", f"{window_days}일"],
         ["심각도 수식", f"{'+'.join(sev_num) or '∅'} / {'+'.join(sev_den) or '∅'}"],
         ["에스컬레이션 최소 건수", min_total],
@@ -2571,7 +3562,7 @@ def generate_full_dashboard_report(
         ["키워드", keyword_text or "(없음)"],
         ["Report/MDR ID", ", ".join(id_filters) if id_filters else "(없음)"],
         ["문제 코드 번호", ", ".join(code_filters) if code_filters else "(없음)"],
-        ["MDR 보고 구분", "초기 보고" if report_stage == "initial" else ("후속 수정" if report_stage == "followup" else "(전체)")],
+        ["Type of Report", _report_stage_display(report_stage)],
         ["최근 윈도우", f"{window_days}일"],
         ["심각도 수식(분자/분모)", f"{'+'.join(sev_num) or '∅'} / {'+'.join(sev_den) or '∅'}"],
         ["에스컬레이션 최소 건수", min_total],
@@ -2950,8 +3941,25 @@ all_brands, all_event_types, min_date, max_date, total_reports = load_metadata(m
 BRAND_GROUPS = load_brand_groups()
 CANONICAL_TO_MEMBERS, MEMBER_TO_CANONICAL = build_brand_alias_maps(BRAND_GROUPS)
 available_cols = detect_columns(mtime)
-# 필터용 표시 브랜드: 그룹 대표명이 있으면 대표명으로 표시
-display_brands = sorted({str(normalize_brand_value(b, MEMBER_TO_CANONICAL)) for b in all_brands if str(b).strip()})
+# 필터용 표시 브랜드: 그룹 대표명이 있으면 대표명으로 표시한다. 사용자 정의
+# 그룹은 실제 브랜드와 이름이 같아도 바로 구분되도록 항상 목록 맨 위에 둔다.
+_display_brand_set = {
+    str(normalize_brand_value(b, MEMBER_TO_CANONICAL))
+    for b in all_brands if str(b).strip()
+}
+_brand_group_names = set(CANONICAL_TO_MEMBERS)
+_display_brand_groups = _ordered_brand_names(
+    b for b in _display_brand_set if b in _brand_group_names
+)
+_display_brand_singles = _ordered_brand_names(
+    b for b in _display_brand_set if b not in _brand_group_names
+)
+display_brands = _display_brand_groups + _display_brand_singles
+
+
+def _brand_filter_label(brand: str) -> str:
+    """브랜드 필터에서 사용자 정의 그룹을 파란 표식으로 구분."""
+    return f"🔵 [그룹] {brand}" if brand in _brand_group_names else brand
 # 구 버전 DB 대응: 신규 칼럼이 없는지 확인
 _missing_new_cols = [c for c in (
     "manufacturer_country", "patient_sex", "patient_age",
@@ -2967,202 +3975,265 @@ if total_reports == 0:
 
 with st.sidebar:
     st.title("🔎 필터")
-    st.caption(f"DB: `{DB_PATH.name}` · 총 {total_reports:,} 건 수집됨")
+    _cov = (f"{min_date:%Y/%m/%d} ~ {max_date:%Y/%m/%d}"
+            if (min_date and max_date) else "기간 정보 없음")
+    st.caption(f"DB: `{DB_PATH.name}` · 총 {total_reports:,} 건")
+    st.caption(f"📅 수록 기간(DATE_RECEIVED): **{_cov}**")
+
+    if (
+        "active_page" not in st.session_state
+        or st.session_state.active_page not in DASHBOARD_PAGE_OPTIONS
+    ):
+        st.session_state.active_page = DASHBOARD_PAGE_OPTIONS[0]
+    page = st.radio(
+        "화면 선택",
+        DASHBOARD_PAGE_OPTIONS,
+        index=DASHBOARD_PAGE_OPTIONS.index(st.session_state.active_page),
+        key="page_select",
+    )
+    st.session_state.active_page = page
 
     with st.expander("🧩 브랜드 그룹(대표명) 설정", expanded=False):
-        st.markdown(
-            """
-            <style>
-            /* checkbox 선택(checked)된 항목을 파스텔 톤으로 강조 */
-            :root{
-                --brandMemberBg: #f9e7f6;
-                --brandMemberBorder: #ebc7e8;
-                --brandMemberAccent: #b65fc0;
-            }
-            .stCheckbox input[type="checkbox"]:checked{
-                accent-color: var(--brandMemberAccent) !important;
-            }
-            /* DOM 구조가 버전에 따라 달라서, 여러 패턴을 함께 지정 */
-            .stCheckbox input[type="checkbox"]:checked + div,
-            .stCheckbox input[type="checkbox"]:checked + span,
-            .stCheckbox input[type="checkbox"]:checked ~ div,
-            .stCheckbox input[type="checkbox"]:checked ~ span{
-                background: var(--brandMemberBg) !important;
-                border: 1px solid var(--brandMemberBorder) !important;
-                border-radius: 10px !important;
-                padding: 2px 8px !important;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.caption(
-            "DB 에 있는 브랜드명을 여러 개 선택해 1개의 대표명으로 묶을 수 있습니다. "
-            "저장 후 모든 통계 집계는 대표명 기준으로 처리됩니다."
-        )
-
-        # 새 그룹을 저장한 직후에는 다음 rerun에서 자동으로
-        # "(새 그룹 만들기)"로 전환하고 입력값(대표명/멤버)을 초기 상태로 맞춥니다.
-        # (중요) 버튼 핸들러 안에서 위젯 키를 직접 바꾸면 StreamlitAPIException 이 날 수 있어
-        # 여기서는 플래그만 처리합니다.
-        if st.session_state.get("_brand_group_after_save_new_mode"):
-            st.session_state["brand_group_edit_target"] = "(새 그룹 만들기)"
-            st.session_state["_brand_group_loaded_target"] = "__after_save_new__"
-            st.session_state["_brand_group_after_save_new_mode"] = False
-
-        edit_target = st.selectbox(
-            "수정할 그룹",
-            options=["(새 그룹 만들기)"] + sorted(BRAND_GROUPS.keys()),
-            index=0,
-            key="brand_group_edit_target",
-        )
-        default_name = "" if edit_target == "(새 그룹 만들기)" else edit_target
-        default_members = [] if edit_target == "(새 그룹 만들기)" else BRAND_GROUPS.get(edit_target, [])
-
-        # edit_target 이 바뀌면 입력칸 값도 해당 그룹 값으로 동기화.
-        # (Streamlit session_state 가 이전 입력을 유지해 기본값이 안 보이는 문제 방지)
-        loaded_target = st.session_state.get("_brand_group_loaded_target")
-        if loaded_target != edit_target:
-            st.session_state["brand_group_canonical_name"] = default_name
-            # 저장된 그룹 멤버를 실제 DB 브랜드값과 정규화 비교로 매칭한다.
-            # (brand_groups.json 의 표기가 DB 의 띄어쓰기/대소문자와 달라도 선택되도록)
-            default_norm = {_norm_member(m) for m in default_members}
-            matched_members = [b for b in all_brands if _norm_member(b) in default_norm]
-            st.session_state["brand_group_members"] = matched_members
-            # checkbox 키들도 같이 동기화(버튼 저장 후 '새 그룹 만들기'로 갈 때 초기화 보장)
-            matched_norm = {_norm_member(b) for b in matched_members}
-            for b in all_brands:
-                st.session_state[f"brand_group_member_cb::{b}"] = _norm_member(b) in matched_norm
-            st.session_state["_brand_group_loaded_target"] = edit_target
-
-        canonical_name = st.text_input(
-            "대표 브랜드명",
-            key="brand_group_canonical_name",
-            placeholder="예: DEXCOM G7",
-        ).strip()
-
-        # 그룹별(대표명별)로 다른 파스텔 색 적용
-        seed = canonical_name or ("NEW_GROUP" if edit_target == "(새 그룹 만들기)" else edit_target)
-        hue = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16) % 360
-        st.markdown(
-            f"<style>:root{{--brandMemberBg: hsl({hue}, 70%, 90%);--brandMemberBorder: hsl({hue}, 65%, 80%);--brandMemberAccent: hsl({hue}, 55%, 55%);}}</style>",
-            unsafe_allow_html=True,
-        )
-
-        member_search = st.text_input(
-            "멤버 검색 (부분일치)",
-            value="",
-            key="brand_group_member_search",
-            placeholder="예: G7 / SENSOR / LIBRE",
-        ).strip()
-        member_max = st.slider(
-            "표시 최대(성능/가독성용)",
-            min_value=50,
-            max_value=2000,
-            value=600,
-            step=50,
-            key="brand_group_member_max",
-        )
-        hide_selected_members = st.checkbox(
-            "그룹에 이미 포함된 브랜드는 제외하기",
+        brand_editor_enabled = st.checkbox(
+            "브랜드 그룹 편집기 불러오기",
             value=False,
-            key="brand_group_hide_selected",
-            help="체크하면 **이미 저장된 다른 그룹에 배정된 브랜드**를 목록에서 숨겨, "
-                 "새 그룹에 넣을 미배정 브랜드만 보여줍니다. "
-                 "현재 편집 중인 그룹의 멤버와 이번에 체크한 브랜드는 계속 표시됩니다.",
+            key="brand_group_editor_enabled",
+            help="브랜드 체크박스가 많아 필요할 때만 편집기를 불러옵니다.",
         )
-
-        base_members = [
-            b for b in all_brands
-            if (not member_search) or (member_search.lower() in str(b).lower())
-        ][: int(member_max)]
-
-        # 선택 상태의 단일 진실 공급원(source of truth)은 위젯 cb_key 가 아니라
-        # 평범한 세션 키 `brand_group_members` 다. (위젯 상태는 렌더링되지 않으면
-        # Streamlit 이 비결정적으로 정리해버려 "제외하기"가 들쭉날쭉해진다.)
-        selected_norm = {_norm_member(x) for x in st.session_state.get("brand_group_members", [])}
-
-        # "이미 포함된 브랜드 제외" = 이미 저장된 *다른* 그룹에 배정된 브랜드를 숨긴다.
-        # (현재 편집 중인 그룹 edit_target 의 멤버는 편집을 위해 계속 보여야 하므로 제외)
-        already_grouped_norm: Set[str] = set()
-        for _gname, _gmembers in BRAND_GROUPS.items():
-            if _gname == edit_target:
-                continue
-            for _m in _gmembers:
-                already_grouped_norm.add(_norm_member(_m))
-
-        # 핵심: 제외하기 체크 시, 다른 그룹에 이미 배정된 브랜드를 정규화 비교로 숨긴다.
-        # 단, 이번 세션에서 직접 체크한 브랜드(selected_norm)는 항상 보이게 유지.
-        if hide_selected_members:
-            visible_members = [
-                b for b in base_members
-                if _norm_member(b) not in already_grouped_norm
-                or _norm_member(b) in selected_norm
-            ]
+        if not brand_editor_enabled:
+            st.caption("일반 검색은 아래 필터에서 바로 사용할 수 있습니다.")
         else:
-            visible_members = base_members
-
-        def _toggle_brand_member(brand: str) -> None:
-            sel = set(st.session_state.get("brand_group_members", []))
-            cb_key = f"brand_group_member_cb::{brand}"
-            if st.session_state.get(cb_key, False):
-                sel.add(brand)
-            else:
-                sel.discard(brand)
-            st.session_state["brand_group_members"] = sorted(sel)
-
-        # 멀티셀렉트 대신 checkbox 목록을 써서,
-        # '이미 선택된 항목'도 목록에 보이면서 파스텔로 강조되도록 구현합니다.
-        # 각 체크박스 상태는 렌더링 직전에 source of truth 로부터 동기화한다.
-        for b in visible_members:
-            cb_key = f"brand_group_member_cb::{b}"
-            st.session_state[cb_key] = _norm_member(b) in selected_norm
-            st.checkbox(
-                b,
-                key=cb_key,
-                label_visibility="visible",
-                on_change=lambda bb=b: _toggle_brand_member(bb),
+            st.markdown(
+                """
+                <style>
+                /* checkbox 선택(checked)된 항목을 파스텔 톤으로 강조 */
+                :root{
+                    --brandMemberBg: #f9e7f6;
+                    --brandMemberBorder: #ebc7e8;
+                    --brandMemberAccent: #b65fc0;
+                }
+                .stCheckbox input[type="checkbox"]:checked{
+                    accent-color: var(--brandMemberAccent) !important;
+                }
+                /* DOM 구조가 버전에 따라 달라서, 여러 패턴을 함께 지정 */
+                .stCheckbox input[type="checkbox"]:checked + div,
+                .stCheckbox input[type="checkbox"]:checked + span,
+                .stCheckbox input[type="checkbox"]:checked ~ div,
+                .stCheckbox input[type="checkbox"]:checked ~ span{
+                    background: var(--brandMemberBg) !important;
+                    border: 1px solid var(--brandMemberBorder) !important;
+                    border-radius: 10px !important;
+                    padding: 2px 8px !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            st.caption(
+                "DB 에 있는 브랜드명을 여러 개 선택해 1개의 대표명으로 묶을 수 있습니다. "
+                "저장 후 모든 통계 집계는 대표명 기준으로 처리됩니다."
             )
 
-        selected_members = st.session_state.get("brand_group_members", [])
-        c_save, c_delete = st.columns(2)
-        with c_save:
-            if st.button("그룹 저장/갱신", use_container_width=True, key="btn_save_brand_group"):
-                if not canonical_name:
-                    st.warning("대표 브랜드명을 입력해 주세요.")
-                elif not selected_members:
-                    st.warning("그룹 멤버를 1개 이상 선택해 주세요.")
-                else:
-                    is_new_mode = edit_target == "(새 그룹 만들기)"
-                    updated = dict(BRAND_GROUPS)
-                    if edit_target != "(새 그룹 만들기)" and edit_target != canonical_name:
-                        updated.pop(edit_target, None)
-                    updated[canonical_name] = sorted(set(selected_members))
-                    save_brand_groups(updated)
-                    st.cache_data.clear()
-                    if is_new_mode:
-                        # 위젯 키를 여기서 직접 바꾸지 말고, 다음 rerun에서 초기화합니다.
-                        st.session_state["_brand_group_after_save_new_mode"] = True
-                    st.success(f"저장 완료: {canonical_name} ({len(selected_members)}개 멤버)")
-                    st.rerun()
-        with c_delete:
-            if st.button("선택 그룹 삭제", use_container_width=True, key="btn_delete_brand_group"):
-                if edit_target == "(새 그룹 만들기)":
-                    st.info("삭제할 기존 그룹을 먼저 선택해 주세요.")
-                else:
-                    updated = dict(BRAND_GROUPS)
-                    updated.pop(edit_target, None)
-                    save_brand_groups(updated)
-                    st.cache_data.clear()
-                    st.success(f"삭제 완료: {edit_target}")
-                    st.rerun()
+            # 새 그룹을 저장한 직후에는 다음 rerun에서 자동으로
+            # "(새 그룹 만들기)"로 전환하고 입력값(대표명/멤버)을 초기 상태로 맞춥니다.
+            # (중요) 버튼 핸들러 안에서 위젯 키를 직접 바꾸면 StreamlitAPIException 이 날 수 있어
+            # 여기서는 플래그만 처리합니다.
+            if st.session_state.get("_brand_group_after_save_new_mode"):
+                st.session_state["brand_group_edit_target"] = "(새 그룹 만들기)"
+                st.session_state["_brand_group_loaded_target"] = "__after_save_new__"
+                st.session_state["_brand_group_after_save_new_mode"] = False
 
-        if BRAND_GROUPS:
-            st.markdown("**저장된 그룹**")
-            for canon in sorted(BRAND_GROUPS.keys()):
-                members_preview = ", ".join(BRAND_GROUPS[canon][:5])
-                suffix = " ..." if len(BRAND_GROUPS[canon]) > 5 else ""
-                st.caption(f"- {canon} ← {members_preview}{suffix}")
+            edit_target = st.selectbox(
+                "수정할 그룹",
+                options=["(새 그룹 만들기)"] + sorted(BRAND_GROUPS.keys()),
+                index=0,
+                key="brand_group_edit_target",
+            )
+            default_name = "" if edit_target == "(새 그룹 만들기)" else edit_target
+            default_members = [] if edit_target == "(새 그룹 만들기)" else BRAND_GROUPS.get(edit_target, [])
+
+            # edit_target 이 바뀌면 입력칸 값도 해당 그룹 값으로 동기화.
+            # (Streamlit session_state 가 이전 입력을 유지해 기본값이 안 보이는 문제 방지)
+            loaded_target = st.session_state.get("_brand_group_loaded_target")
+            if loaded_target != edit_target:
+                st.session_state["brand_group_canonical_name"] = default_name
+                # 저장된 그룹 멤버를 실제 DB 브랜드값과 정규화 비교로 매칭한다.
+                # (brand_groups.json 의 표기가 DB 의 띄어쓰기/대소문자와 달라도 선택되도록)
+                default_norm = {_norm_member(m) for m in default_members}
+                matched_members = [b for b in all_brands if _norm_member(b) in default_norm]
+                st.session_state["brand_group_members"] = matched_members
+                # 체크박스 키에 세대 번호를 붙여 쓰기 때문에, 세대만 올리면
+                # 다음 렌더에서 새 키가 만들어져 value= 가 그대로 반영된다.
+                # (키를 하나씩 갈아끼우던 예전 방식은 폼 제출값과 충돌한다.)
+                st.session_state["_brand_group_cb_gen"] = (
+                    st.session_state.get("_brand_group_cb_gen", 0) + 1
+                )
+                st.session_state["_brand_group_loaded_target"] = edit_target
+
+            canonical_name = st.text_input(
+                "대표 브랜드명",
+                key="brand_group_canonical_name",
+                placeholder="예: DEXCOM G7",
+            ).strip()
+
+            # 그룹별(대표명별)로 다른 파스텔 색 적용
+            seed = canonical_name or ("NEW_GROUP" if edit_target == "(새 그룹 만들기)" else edit_target)
+            hue = int(hashlib.md5(seed.encode("utf-8")).hexdigest(), 16) % 360
+            st.markdown(
+                f"<style>:root{{--brandMemberBg: hsl({hue}, 70%, 90%);--brandMemberBorder: hsl({hue}, 65%, 80%);--brandMemberAccent: hsl({hue}, 55%, 55%);}}</style>",
+                unsafe_allow_html=True,
+            )
+
+            member_search = st.text_input(
+                "멤버 검색 (부분일치)",
+                value="",
+                key="brand_group_member_search",
+                placeholder="예: G7 / SENSOR / LIBRE",
+            ).strip()
+            member_max = st.slider(
+                "표시 최대(성능/가독성용)",
+                min_value=50,
+                max_value=2000,
+                value=600,
+                step=50,
+                key="brand_group_member_max",
+            )
+            hide_selected_members = st.checkbox(
+                "그룹에 이미 포함된 브랜드는 제외하기",
+                value=False,
+                key="brand_group_hide_selected",
+                help="체크하면 **이미 저장된 다른 그룹에 배정된 브랜드**를 목록에서 숨겨, "
+                     "새 그룹에 넣을 미배정 브랜드만 보여줍니다. "
+                     "현재 편집 중인 그룹의 멤버와 이번에 체크한 브랜드는 계속 표시됩니다.",
+            )
+
+            base_members = [
+                b for b in all_brands
+                if (not member_search) or (member_search.lower() in str(b).lower())
+            ][: int(member_max)]
+
+            # 선택 상태의 단일 진실 공급원(source of truth)은 위젯 cb_key 가 아니라
+            # 평범한 세션 키 `brand_group_members` 다. (위젯 상태는 렌더링되지 않으면
+            # Streamlit 이 비결정적으로 정리해버려 "제외하기"가 들쭉날쭉해진다.)
+            selected_norm = {_norm_member(x) for x in st.session_state.get("brand_group_members", [])}
+
+            # "이미 포함된 브랜드 제외" = 이미 저장된 *다른* 그룹에 배정된 브랜드를 숨긴다.
+            # (현재 편집 중인 그룹 edit_target 의 멤버는 편집을 위해 계속 보여야 하므로 제외)
+            already_grouped_norm: Set[str] = set()
+            for _gname, _gmembers in BRAND_GROUPS.items():
+                if _gname == edit_target:
+                    continue
+                for _m in _gmembers:
+                    already_grouped_norm.add(_norm_member(_m))
+
+            # 핵심: 제외하기 체크 시, 다른 그룹에 이미 배정된 브랜드를 정규화 비교로 숨긴다.
+            # 단, 이번 세션에서 직접 체크한 브랜드(selected_norm)는 항상 보이게 유지.
+            if hide_selected_members:
+                visible_members = [
+                    b for b in base_members
+                    if _norm_member(b) not in already_grouped_norm
+                    or _norm_member(b) in selected_norm
+                ]
+            else:
+                visible_members = base_members
+
+            # 체크박스를 st.form 으로 묶는다.
+            #
+            # 예전에는 체크박스마다 on_change 콜백을 달았는데, Streamlit 은
+            # 위젯이 바뀔 때마다 스크립트를 처음부터 다시 실행한다. 브랜드가
+            # 수백 개인 데다 매 재실행이 27GB DB 질의까지 다시 돌려서, 하나
+            # 누를 때마다 화면이 깜빡이고 재실행 중에 들어온 클릭은 유실됐다.
+            # 폼 안에서는 제출 전까지 재실행이 일어나지 않으므로 마음껏 고르고
+            # 마지막에 한 번만 반영된다.
+            _gen = st.session_state.get("_brand_group_cb_gen", 0)
+
+            with st.form("brand_group_members_form", clear_on_submit=False):
+                st.caption(
+                    f"멤버로 넣을 브랜드를 고른 뒤 아래 **선택 반영**을 누르세요. "
+                    f"(표시 {len(visible_members):,}개 · 현재 선택 {len(selected_norm):,}개)"
+                )
+                for b in visible_members:
+                    st.checkbox(
+                        b,
+                        value=_norm_member(b) in selected_norm,
+                        key=f"brand_group_member_cb::{_gen}::{b}",
+                        label_visibility="visible",
+                    )
+                members_applied = st.form_submit_button(
+                    "선택 반영", use_container_width=True
+                )
+
+            if members_applied:
+                sel = set(st.session_state.get("brand_group_members", []))
+                # 화면에 보이지 않은(검색/제외 필터로 가려진) 선택은 건드리지 않는다.
+                for b in visible_members:
+                    if st.session_state.get(f"brand_group_member_cb::{_gen}::{b}"):
+                        sel.add(b)
+                    else:
+                        sel.discard(b)
+                st.session_state["brand_group_members"] = sorted(sel)
+                # 세대를 올려 다음 렌더에서 새 키 + value= 로 다시 그린다.
+                st.session_state["_brand_group_cb_gen"] = _gen + 1
+                st.rerun()
+
+            selected_members = st.session_state.get("brand_group_members", [])
+            if selected_members:
+                st.caption(f"✅ 현재 그룹 멤버 {len(selected_members):,}개")
+            c_save, c_delete = st.columns(2)
+            with c_save:
+                if st.button("그룹 저장/갱신", use_container_width=True, key="btn_save_brand_group"):
+                    if not canonical_name:
+                        st.warning("대표 브랜드명을 입력해 주세요.")
+                    elif not selected_members:
+                        st.warning("그룹 멤버를 1개 이상 선택해 주세요.")
+                    else:
+                        is_new_mode = edit_target == "(새 그룹 만들기)"
+                        updated = dict(BRAND_GROUPS)
+                        if edit_target != "(새 그룹 만들기)" and edit_target != canonical_name:
+                            updated.pop(edit_target, None)
+                        selected_set = {m for m in selected_members if str(m).strip()}
+                        selected_norm = {_norm_member(m) for m in selected_set}
+                        conflicts: List[str] = []
+                        for other_group, other_members in updated.items():
+                            if other_group == canonical_name:
+                                continue
+                            other_norm = {_norm_member(m) for m in other_members}
+                            overlap = sorted(selected_norm & other_norm)
+                            if overlap:
+                                conflicts.append(f"{other_group}: {', '.join(overlap[:5])}")
+                        if conflicts:
+                            st.warning(
+                                "같은 브랜드는 하나의 대표 그룹에만 속할 수 있습니다. "
+                                "충돌을 먼저 해소한 뒤 저장하세요.\n"
+                                + " / ".join(conflicts)
+                            )
+                        else:
+                            updated[canonical_name] = sorted(selected_set)
+                            save_brand_groups(updated)
+                            st.cache_data.clear()
+                            if is_new_mode:
+                                # 위젯 키를 여기서 직접 바꾸지 말고, 다음 rerun에서 초기화합니다.
+                                st.session_state["_brand_group_after_save_new_mode"] = True
+                            st.success(f"저장 완료: {canonical_name} ({len(selected_members)}개 멤버)")
+                            st.rerun()
+            with c_delete:
+                if st.button("선택 그룹 삭제", use_container_width=True, key="btn_delete_brand_group"):
+                    if edit_target == "(새 그룹 만들기)":
+                        st.info("삭제할 기존 그룹을 먼저 선택해 주세요.")
+                    else:
+                        updated = dict(BRAND_GROUPS)
+                        updated.pop(edit_target, None)
+                        save_brand_groups(updated)
+                        st.cache_data.clear()
+                        st.success(f"삭제 완료: {edit_target}")
+                        st.rerun()
+
+            if BRAND_GROUPS:
+                st.markdown("**저장된 그룹**")
+                for canon in sorted(BRAND_GROUPS.keys()):
+                    members_preview = ", ".join(BRAND_GROUPS[canon][:5])
+                    suffix = " ..." if len(BRAND_GROUPS[canon]) > 5 else ""
+                    st.caption(f"- {canon} ← {members_preview}{suffix}")
 
     # 날짜 범위 기본값/선택 가능 범위
     default_from = min_date or (date.today() - timedelta(days=365 * 2))
@@ -3184,6 +4255,7 @@ with st.sidebar:
         "keyword": "",
         "id_search": "",
         "code_search": "",
+        "report_stages": [],
         "report_stage": "all",
         "max_rows": 5000,
     }
@@ -3202,7 +4274,9 @@ with st.sidebar:
     applied_kw = str(applied.get("keyword", "")).strip()
     applied_id_search = str(applied.get("id_search", "")).strip()
     applied_code_search = str(applied.get("code_search", "")).strip()
-    applied_report_stage = _normalize_report_stage(applied.get("report_stage", "all"))
+    applied_report_stages = _normalize_report_stage_list(
+        applied.get("report_stages", applied.get("report_stage", []))
+    )
     applied_max_rows = int(applied.get("max_rows", 5000))
     max_rows_cap = max(100, int(total_reports))
     if applied_max_rows < 100:
@@ -3223,12 +4297,98 @@ with st.sidebar:
     pending_kw = str(pending.get("keyword", "")).strip()
     pending_id_search = str(pending.get("id_search", "")).strip()
     pending_code_search = str(pending.get("code_search", "")).strip()
-    pending_report_stage = _normalize_report_stage(pending.get("report_stage", "all"))
+    pending_report_stages = _normalize_report_stage_list(
+        pending.get("report_stages", pending.get("report_stage", []))
+    )
     pending_max_rows = int(pending.get("max_rows", 5000))
     if pending_max_rows < 100:
         pending_max_rows = 100
     if pending_max_rows > max_rows_cap:
         pending_max_rows = max_rows_cap
+
+    # --- 브랜드 빠른 선택 (폼 바깥) ---------------------------------------
+    # MAUDE 의 brand_name 은 보고자가 자유 텍스트로 적는 칸이라 같은 제품도
+    # 표기가 갈린다(예: DEXCOM* 321종 중 241종이 3건 이하). 하나씩 고르는 건
+    # 비현실적이라, 부분일치로 찾아 한 번에 넣고 뺄 수 있게 한다.
+    if "pending_brands" not in st.session_state:
+        st.session_state.pending_brands = list(pending_brands)
+    else:
+        # 브랜드 그룹 설정이 바뀌면 options 목록도 바뀐다. 목록에 없는 값이
+        # 남아 있으면 multiselect 가 오류를 내므로 여기서 걸러둔다.
+        _valid = set(display_brands)
+        _kept = [b for b in st.session_state.pending_brands if b in _valid]
+        if len(_kept) != len(st.session_state.pending_brands):
+            st.session_state.pending_brands = _kept
+
+    with st.expander("🔎 브랜드 빠른 선택 (검색해서 한 번에 추가)", expanded=False):
+        brand_q = st.text_input(
+            "브랜드 검색",
+            key="brand_search_q",
+            placeholder="예: freestyle / dexcom g7 / omnipod",
+            help="대소문자를 구분하지 않고 부분일치로 찾습니다. 공백으로 여러 낱말을 "
+                 "넣으면 모두 포함된 브랜드만 걸립니다.",
+        )
+        terms = [t for t in str(brand_q or "").lower().split() if t]
+        if terms:
+            # 대표명뿐 아니라 그 그룹에 묶인 원본 브랜드명까지 함께 본다.
+            # 예: 'Libre 3' 그룹의 멤버는 ABBOTT FREESTYLE LIBRE 3 … 인데
+            # 대표명에는 FREESTYLE 이 없다. 대표명만 보면 'freestyle' 검색에서
+            # Libre 계열이 통째로 빠져 집계가 절반이 되는 문제가 있었다.
+            def _haystack(display: str) -> str:
+                members = CANONICAL_TO_MEMBERS.get(display) or []
+                return (display + " " + " ".join(map(str, members))).lower()
+
+            matched = [b for b in display_brands
+                       if all(t in _haystack(b) for t in terms)]
+        else:
+            matched = []
+
+        selected_now = set(st.session_state.get("pending_brands", []))
+        if terms:
+            add_n = len([b for b in matched if b not in selected_now])
+            del_n = len([b for b in matched if b in selected_now])
+            st.caption(
+                f"**{len(matched):,}개** 일치 · 이미 선택됨 {del_n:,}개 · 추가 가능 {add_n:,}개"
+            )
+            b1, b2, b3 = st.columns([2, 2, 1])
+            if b1.button(f"➕ 일치 {len(matched):,}개 모두 추가",
+                         disabled=not matched, width="stretch"):
+                st.session_state.pending_brands = sorted(selected_now | set(matched))
+                st.rerun()
+            if b2.button(f"➖ 일치 항목 선택 해제",
+                         disabled=not del_n, width="stretch"):
+                st.session_state.pending_brands = sorted(selected_now - set(matched))
+                st.rerun()
+            if b3.button("전체 해제", disabled=not selected_now, width="stretch"):
+                st.session_state.pending_brands = []
+                st.rerun()
+            if matched:
+                preview = matched[:200]
+                st.caption("일치 목록" + (f" (상위 200개만 표시 / 총 {len(matched):,}개)"
+                                      if len(matched) > 200 else ""))
+                st.dataframe(
+                    pd.DataFrame({
+                        "브랜드(대표명)": preview,
+                        "묶인 원본": [
+                            len(CANONICAL_TO_MEMBERS.get(b) or []) or ""
+                            for b in preview
+                        ],
+                        "선택됨": ["✓" if b in selected_now else ""
+                                for b in preview],
+                    }),
+                    hide_index=True, height=min(320, 40 + 28 * len(preview)),
+                    width="stretch",
+                )
+            else:
+                st.info("일치하는 브랜드가 없습니다. 검색어를 줄여보세요.")
+        else:
+            st.caption(
+                f"검색어를 입력하면 일치하는 브랜드를 한 번에 추가할 수 있습니다. "
+                f"현재 선택 {len(selected_now):,}개 / 전체 {len(display_brands):,}개"
+            )
+            if selected_now and st.button("전체 해제", key="brand_clear_all"):
+                st.session_state.pending_brands = []
+                st.rerun()
 
     with st.form("filter_form", clear_on_submit=False):
         if _cat_options:
@@ -3241,12 +4401,16 @@ with st.sidebar:
             )
         else:
             form_categories = []  # 구 DB 호환
+        # default 를 주지 않는다: 위의 "빠른 선택"이 st.session_state.pending_brands
+        # 를 직접 바꾸므로, 그 값이 그대로 반영되어야 한다.
         form_brands = st.multiselect(
             "브랜드 (여러 개 선택 가능, 비우면 전체)",
             options=display_brands,
-            default=pending_brands,
             key="pending_brands",
-            help="그룹 대표명을 설정한 경우 대표명 기준으로 표시됩니다.",
+            format_func=_brand_filter_label,
+            help="사용자 정의 그룹은 목록 맨 위에 🔵 [그룹]으로 표시됩니다. "
+                 "그룹 대표명을 설정한 경우 대표명 기준으로 표시됩니다. "
+                 "위의 '브랜드 빠른 선택'에서 검색해 한 번에 넣을 수 있습니다.",
         )
         form_events = st.multiselect(
             "EVENT_TYPE",
@@ -3255,20 +4419,46 @@ with st.sidebar:
             key="pending_event_types",
             help="Death / Injury / Malfunction / Other — 비우면 전체",
         )
-        form_date_range = st.date_input(
-            "DATE_RECEIVED 범위",
-            value=(pending_from, pending_to),
-            key="pending_date_range",
+        # 시작일/종료일을 각각 단일 date_input 으로 받는다.
+        # 범위 모드(value=(from, to))는 캘린더 클릭에는 편하지만 직접 타이핑할 때
+        # 입력이 중간에 확정돼 날짜가 잘못 잡히는 문제가 있었다(2025/12/31 을
+        # 치면 2025/12/01 이 되는 식). 단일 모드는 그 문제가 없다.
+        _dc1, _dc2 = st.columns(2)
+        _d_from = _dc1.date_input(
+            "DATE_RECEIVED 시작",
+            value=pending_from,
+            key="pending_date_from",
             min_value=picker_min,
             max_value=picker_max,
-            help="FDA 접수일 기준. 캘린더에서 두 날짜를 클릭해 범위 지정. "
-                 "DB 에 없는 구간을 선택해도 OK — 결과가 0건일 뿐 에러가 아닙니다.",
+            format="YYYY/MM/DD",
+            help="FDA 접수일 기준. 직접 입력하거나 캘린더에서 고르세요.",
         )
+        _d_to = _dc2.date_input(
+            "DATE_RECEIVED 종료",
+            value=pending_to,
+            key="pending_date_to",
+            min_value=picker_min,
+            max_value=picker_max,
+            format="YYYY/MM/DD",
+            help="DB 에 없는 구간을 선택해도 OK — 결과가 0건일 뿐 에러가 아닙니다.",
+        )
+        # 거꾸로 넣어도 조회가 0건이 되지 않도록 여기서 정렬해 둔다.
+        form_date_range = (min(_d_from, _d_to), max(_d_from, _d_to))
+        if _d_from > _d_to:
+            st.caption("⚠️ 시작일이 종료일보다 늦어 두 날짜를 바꿔서 적용합니다.")
         form_keyword = st.text_input(
             "키워드 검색",
             value=pending_kw,
             key="pending_keyword",
-            help="event_description / manufacturer_narrative / 요약 / patient·product problems / report_number / mdr_report_key 에서 부분일치 검색",
+            help=(
+                "등록된 키워드만 고르는 방식이 아니라, event_description / "
+                "manufacturer_narrative / 요약 / patient·product problems / "
+                "report_number / mdr_report_key 에서 입력 문구를 부분일치로 검색합니다. "
+                "FDA 원문이 영어이므로 영문 검색을 권장합니다."
+            ),
+        )
+        st.caption(
+            "검색어 예시: " + " · ".join(KEYWORD_SEARCH_EXAMPLES[:8])
         )
         form_id_search = st.text_input(
             "Report Number / MDR Report Key 검색",
@@ -3284,20 +4474,24 @@ with st.sidebar:
                  "Health Effect - Clinical Code / Medical Device Problem Code 양쪽에서 매칭합니다.",
         )
         report_stage_options = {
-            "전체": "all",
-            "초기 보고만 (Initial submission)": "initial",
-            "후속 수정만 (Followup)": "followup",
+            "초기 보고만 (Initial)": "initial",
+            "Followup 1회": "followup1",
+            "Followup 2회": "followup2",
+            "Followup 3회 이상": "followup3plus",
         }
-        stage_labels = list(report_stage_options.keys())
         inv_stage = {v: k for k, v in report_stage_options.items()}
-        form_report_stage_label = st.selectbox(
-            "MDR 보고 구분",
-            options=stage_labels,
-            index=stage_labels.index(inv_stage.get(pending_report_stage, "전체")),
-            key="pending_report_stage_label",
-            help="초기 보고(Initial submission)와 후속 수정(Followup)을 분리해서 볼 수 있습니다.",
+        form_report_stages = st.multiselect(
+            "Type of Report",
+            options=list(report_stage_options.keys()),
+            default=[inv_stage[s] for s in pending_report_stages if s in inv_stage],
+            key="pending_report_stages",
+            help="여러 개 선택 가능. 비우면 전체. Initial, Followup 1회/2회/3회 이상을 조합해서 볼 수 있습니다.",
         )
-        form_report_stage = report_stage_options[form_report_stage_label]
+        form_report_stages_value = [
+            report_stage_options[label]
+            for label in form_report_stages
+            if label in report_stage_options
+        ]
         form_max_rows = st.slider(
             "최대 표시 건수 (성능용 제한)",
             min_value=100, max_value=max_rows_cap, step=500, value=pending_max_rows,
@@ -3327,7 +4521,8 @@ with st.sidebar:
             "keyword": form_keyword.strip(),
             "id_search": form_id_search.strip(),
             "code_search": form_code_search.strip(),
-            "report_stage": _normalize_report_stage(form_report_stage),
+            "report_stages": form_report_stages_value,
+            "report_stage": form_report_stages_value[0] if len(form_report_stages_value) == 1 else "all",
             "max_rows": int(form_max_rows),
         }
         st.session_state.applied_filters = st.session_state.pending_filters.copy()
@@ -3349,11 +4544,13 @@ with st.sidebar:
     keyword_display = keyword
     id_search = str(applied.get("id_search", "")).strip()
     code_search = str(applied.get("code_search", "")).strip()
-    report_stage = _normalize_report_stage(applied.get("report_stage", "all"))
+    report_stages = _normalize_report_stage_list(
+        applied.get("report_stages", applied.get("report_stage", []))
+    )
     query_keyword = _compose_search_keyword(
         keyword,
         code_search,
-        report_stage=report_stage,
+        report_stage=report_stages,
         id_search=id_search,
     )
     max_rows = int(applied.get("max_rows", 5000))
@@ -3409,10 +4606,7 @@ with st.sidebar:
         if code_search:
             parsed_codes = _parse_code_numbers(code_search)
             st.write(f"**인식된 코드:** {', '.join(parsed_codes) if parsed_codes else '(없음)'}")
-        st.write(
-            "**MDR 보고 구분:** "
-            + ("초기 보고" if report_stage == "initial" else ("후속 수정" if report_stage == "followup" else "(전체)"))
-        )
+        st.write(f"**Type of Report:** {_report_stage_display(report_stages)}")
         st.write(f"**최대 표시 건수:** {max_rows:,}건")
     if category_brand_conflict:
         st.warning("선택한 디바이스 카테고리와 브랜드의 교집합이 없어 결과는 0건입니다.")
@@ -3430,26 +4624,78 @@ st.caption(
     "데이터는 `fda_maude_cgm.db` (FDA openFDA API 수집) 에서 실시간으로 읽습니다. "
     "주의: MAUDE 보고 건수는 실제 발생률이 아니라 보고 건수이며, 최근 월은 FDA 반영 지연과 중복 보고의 영향을 받을 수 있습니다."
 )
+st.info(
+    f"📅 **현재 DB 수록 기간: "
+    f"{min_date:%Y년 %m월 %d일} ~ {max_date:%Y년 %m월 %d일}**  "
+    f"(DATE_RECEIVED 기준 · 총 {total_reports:,} 건)"
+    if (min_date and max_date) else
+    f"📅 DB 수록 기간 정보를 읽을 수 없습니다. (총 {total_reports:,} 건)"
+)
 
-COUNT_CARD_CAP = 20000
+full_report_progress = None
+full_report_load_started = None
+if page == "📋 전체 보고서":
+    full_report_load_started = time.perf_counter()
+    full_report_progress = st.progress(
+        5, text="전체 보고서 로딩 5% · 필터 조건 준비 중"
+    )
+
 filtered_has_match = query_has_match(
     mtime, sel_brands_query, sel_events, date_from, date_to, keyword
 )
-filtered_total_capped = query_filtered_count_capped(
-    mtime, sel_brands_query, sel_events, date_from, date_to, keyword, cap=COUNT_CARD_CAP
-)
-filtered_total_display = (
-    f"{COUNT_CARD_CAP:,}+"
-    if filtered_total_capped >= COUNT_CARD_CAP
-    else f"{filtered_total_capped:,}"
-)
+if full_report_progress is not None:
+    full_report_progress.progress(
+        20,
+        text=f"전체 보고서 로딩 20% · 결과 존재 확인 완료 · {time.perf_counter() - full_report_load_started:.1f}초 경과",
+    )
+# 필터 결과 건수는 상한 없이 정확한 값을 계산한다. 전체 보고서 페이지는 표를
+# 먼저 보여주기 위해 카드 자리만 잡아두고 표를 그린 뒤에 값을 채운다.
+def _render_filtered_total(slot, total: Optional[int], exact: bool) -> None:
+    """필터 결과 건수 카드를 그린다. 정확 집계 실패 시 상한 표기로 알린다."""
+    if total is None:
+        slot.metric("필터 결과 건수", "계산 중…")
+    elif exact or total < COUNT_FALLBACK_CAP:
+        # 상한 집계로 물러났더라도 상한에 못 미쳤다면 잘린 것이 아니므로
+        # 그 값이 곧 정확한 건수다. "+" 를 붙이면 오히려 틀린 표시가 된다.
+        slot.metric("필터 결과 건수", f"{total:,}")
+    else:
+        slot.metric("필터 결과 건수", f"{total:,}+", help=(
+            "정확 집계가 제한 시간을 넘겨 상한까지만 셌습니다. "
+            "device_category + brand_name + date_received 커버링 인덱스를 "
+            "추가하면 정확 집계가 가능해집니다."
+        ))
+
+
+defer_filtered_total = page == "📋 전체 보고서"
+filtered_total_exact = True
+if defer_filtered_total:
+    full_report_progress.progress(
+        40,
+        text=f"전체 보고서 로딩 40% · 표 우선 조회 · {time.perf_counter() - full_report_load_started:.1f}초 경과",
+    )
+    filtered_total = None
+else:
+    filtered_total, filtered_total_exact = query_filtered_count(
+        mtime, sel_brands_query, sel_events, date_from, date_to, keyword
+    )
 
 # 지표 카드
 with st.container():
     cols = st.columns(4)
-    cols[0].metric("전체 DB 건수", f"{total_reports:,}")
-    cols[1].metric("필터 결과 건수", filtered_total_display)
-    cols[2].metric("날짜 범위", f"{date_from} ~ {date_to}")
+    _db_cov = (f"{min_date:%Y/%m/%d} ~ {max_date:%Y/%m/%d}"
+               if (min_date and max_date) else "정보 없음")
+    cols[0].metric(
+        "전체 DB 건수", f"{total_reports:,}",
+        help=f"DB 수록 기간(DATE_RECEIVED 기준): {_db_cov}",
+    )
+    filtered_total_slot = cols[1].empty()
+    _render_filtered_total(filtered_total_slot, filtered_total, filtered_total_exact)
+    # 아래는 "지금 적용한 필터"의 기간이다. DB 전체 수록 기간과 다르므로
+    # 라벨에서 구분해 준다(둘을 같은 것으로 오해하기 쉬웠다).
+    cols[2].metric(
+        "필터 날짜 범위", f"{date_from} ~ {date_to}",
+        help=f"DB 수록 기간은 {_db_cov} 입니다.",
+    )
     cols[3].metric("선택 브랜드", f"{len(sel_brands) or '전체'}")
 
 if _missing_new_cols:
@@ -3462,11 +4708,27 @@ if _missing_new_cols:
     )
 
 if not filtered_has_match:
-    st.warning(
-        "필터 결과가 0건입니다. 필터를 완화하거나 기간을 넓혀보세요. "
-        "참고: 브랜드는 **부분 일치** 로 매칭됩니다 — 예) 'DEXCOM' 을 선택하면 "
-        "'DEXCOM G7 CONTINUOUS GLUCOSE MONITORING SYSTEM' 같은 긴 이름도 포함됩니다."
-    )
+    if filtered_total is None:
+        filtered_total, filtered_total_exact = 0, True
+        filtered_total_slot.metric("필터 결과 건수", "0")
+    if full_report_progress is not None:
+        full_report_progress.progress(
+            100,
+            text=f"전체 보고서 로딩 100% · 검색 결과 없음 · 총 {time.perf_counter() - full_report_load_started:.1f}초",
+        )
+    if keyword_display:
+        st.warning(
+            f"현재 선택한 브랜드·EVENT_TYPE·기간에는 **'{keyword_display}'** 키워드를 "
+            "포함한 보고서가 없습니다. 다른 영문 키워드를 사용하거나 기간을 넓혀보세요."
+        )
+        st.info(
+            "사용해 볼 수 있는 CGM 불만 키워드 예시 (영문 원문 부분일치 검색):\n\n"
+            + " · ".join(f"`{term}`" for term in KEYWORD_SEARCH_EXAMPLES)
+        )
+    else:
+        st.warning(
+            "필터 결과가 0건입니다. 브랜드·EVENT_TYPE 필터를 완화하거나 기간을 넓혀보세요."
+        )
     st.stop()
 
 # ---------------------------------------------------------------------------
@@ -3474,24 +4736,7 @@ if not filtered_has_match:
 # ---------------------------------------------------------------------------
 
 if st.session_state.run_queries:
-        page_options = [
-            "🔍 인사이트",
-            "📋 전체 보고서",
-            "⚠️ EVENT_TYPE 분포",
-            "🏥 문제 코드",
-            "🔬 상세 월별 분석",
-            "👤 환자 인구통계",
-            "🏭 제조사 · 국가",
-            "📈 월별 추이",
-        ]
-        if "active_page" not in st.session_state or st.session_state.active_page not in page_options:
-            st.session_state.active_page = page_options[0]
-        page = st.sidebar.radio(
-            "화면 선택",
-            page_options,
-            index=page_options.index(st.session_state.active_page),
-            key="page_select",
-        )
+        page = st.session_state.get("page_select", DASHBOARD_PAGE_OPTIONS[0])
         st.session_state.active_page = page
 
         # ---------------- 탭 1: 🔍 인사이트 (A+C: 개발 리스크 회피 + 규제 선제 대응)
@@ -4108,10 +5353,11 @@ if st.session_state.run_queries:
 
         # ---------------- 탭 2: 전체 보고서
         if page == "📋 전체 보고서":
-            # 상단 KPI는 capped 값이므로, 전체보고서 탭에서만 정확 건수를 별도 계산한다.
-            filtered_total = query_filtered_count(
-                mtime, sel_brands_query, sel_events, date_from, date_to, keyword
-            )
+            if full_report_progress is not None:
+                full_report_progress.progress(
+                    55,
+                    text=f"전체 보고서 로딩 55% · 표 데이터 조회 시작 · {time.perf_counter() - full_report_load_started:.1f}초 경과",
+                )
             if "full_report_rows_loaded" not in st.session_state:
                 st.session_state.full_report_rows_loaded = 200
             if "full_report_last_sig" not in st.session_state:
@@ -4126,27 +5372,155 @@ if st.session_state.run_queries:
             if st.session_state.full_report_last_sig != current_sig:
                 st.session_state.full_report_last_sig = current_sig
                 st.session_state.full_report_rows_loaded = 200
+                st.session_state.full_report_selected_number = ""
+                st.session_state.pop("full_report_table_editor", None)
             visible_limit = min(max_rows, st.session_state.full_report_rows_loaded)
-            st.subheader(f"필터 결과 ({min(visible_limit, filtered_total):,} / {filtered_total:,} 건 표시)")
-            st.caption("처음엔 200건만 보여주고, 아래의 '더 보기' 버튼으로 200건씩 추가 로드합니다.")
+            st.subheader("필터 결과")
+            st.caption("전체 건수를 먼저 세지 않고 표를 우선 표시합니다. 처음엔 200건을 불러옵니다.")
 
-            df = query_reports(
-                mtime, sel_brands_query, sel_events, date_from, date_to, keyword, limit=visible_limit
+            with st.spinner("전체 보고서 표를 불러오는 중..."):
+                fetched_df = query_reports(
+                    mtime, sel_brands_query, sel_events, date_from, date_to, keyword,
+                    limit=visible_limit + 1, preview=True,
+                )
+            has_more_rows = len(fetched_df) > visible_limit
+            df = fetched_df.iloc[:visible_limit].copy()
+            result_label = f"{len(df):,}건 이상" if has_more_rows else f"총 {len(df):,}건"
+            st.markdown(f"**현재 {len(df):,}건 표시 · {result_label}**")
+            if full_report_progress is not None:
+                full_report_progress.progress(
+                    85,
+                    text=f"전체 보고서 로딩 85% · {len(df):,}행 조회 완료 · {time.perf_counter() - full_report_load_started:.1f}초 경과",
+                )
+
+            sort_options = list(df.columns)
+            default_sort_col = "DATE_RECEIVED" if "DATE_RECEIVED" in sort_options else (
+                sort_options[0] if sort_options else ""
+            )
+            if st.session_state.get("full_report_sort_column") not in sort_options:
+                st.session_state.full_report_sort_column = default_sort_col
+            sort_c1, sort_c2 = st.columns([2, 1])
+            with sort_c1:
+                sort_column = st.selectbox(
+                    "정렬 기준 (MDR 선택 후에도 유지)",
+                    options=sort_options,
+                    key="full_report_sort_column",
+                )
+            with sort_c2:
+                sort_direction = st.radio(
+                    "정렬 방향",
+                    options=["내림차순", "오름차순"],
+                    horizontal=True,
+                    key="full_report_sort_direction",
+                )
+            current_sort_sig = (sort_column, sort_direction)
+            if st.session_state.get("full_report_sort_sig") != current_sort_sig:
+                st.session_state.full_report_sort_sig = current_sort_sig
+                st.session_state.full_report_selected_number = ""
+                st.session_state.pop("full_report_table_editor", None)
+            if sort_column:
+                df = df.sort_values(
+                    by=sort_column,
+                    ascending=(sort_direction == "오름차순"),
+                    kind="mergesort",
+                    na_position="last",
+                ).reset_index(drop=True)
+            st.caption(
+                "열 제목을 누른 임시 정렬은 체크 시 초기화될 수 있습니다. "
+                "위 정렬 기준을 사용하면 MDR을 계속 선택해도 순서가 유지됩니다."
             )
 
-            st.dataframe(
-                df,
+            if "full_report_selected_number" not in st.session_state:
+                st.session_state.full_report_selected_number = ""
+
+            editor_df = df.copy()
+            report_number_values = (
+                editor_df["Report Number"].fillna("").astype(str).tolist()
+                if "Report Number" in editor_df.columns
+                else [""] * len(editor_df)
+            )
+            editor_df.insert(
+                0,
+                "선택",
+                [False] * len(report_number_values),
+            )
+            editor_key = "full_report_table_editor"
+
+            def _on_full_report_editor_change(widget_key: str, report_numbers: List[str]) -> None:
+                state = st.session_state.get(widget_key, {})
+                edited_rows = state.get("edited_rows", {}) if isinstance(state, dict) else {}
+                selected_number = st.session_state.get("full_report_selected_number", "")
+                newly_checked: List[str] = []
+                selected_was_unchecked = False
+                for raw_index, changes in edited_rows.items():
+                    if "선택" not in changes:
+                        continue
+                    try:
+                        row_index = int(raw_index)
+                    except (TypeError, ValueError):
+                        continue
+                    if not (0 <= row_index < len(report_numbers)):
+                        continue
+                    number = report_numbers[row_index]
+                    if changes.get("선택"):
+                        if number != selected_number:
+                            newly_checked.append(number)
+                    elif number == selected_number:
+                        selected_was_unchecked = True
+                if newly_checked:
+                    selected_number = newly_checked[-1]
+                elif selected_was_unchecked:
+                    selected_number = ""
+                st.session_state.full_report_selected_number = selected_number
+                # 표 위젯 키는 고정한다. 키를 매 선택마다 교체하면 브라우저가 기존
+                # DOM을 제거/삽입하는 중 removeChild/insertBefore 오류가 발생한다.
+                normalized_rows = {}
+                for index, number in enumerate(report_numbers):
+                    if number == selected_number:
+                        normalized_rows[index] = {"선택": True}
+                    elif index in {int(i) for i in edited_rows.keys() if str(i).isdigit()}:
+                        normalized_rows[index] = {"선택": False}
+                if isinstance(state, dict):
+                    state["edited_rows"] = normalized_rows
+
+            st.data_editor(
+                editor_df,
                 use_container_width=True,
                 height=600,
                 hide_index=True,
+                disabled=[col for col in editor_df.columns if col != "선택"],
+                column_config={
+                    "선택": st.column_config.CheckboxColumn(
+                        "선택", help="상세 조회할 MDR 한 건을 선택합니다.", width="small"
+                    )
+                },
+                key=editor_key,
+                on_change=_on_full_report_editor_change,
+                args=(editor_key, report_number_values),
             )
+            if full_report_progress is not None:
+                full_report_progress.progress(
+                    95,
+                    text=f"전체 보고서 로딩 95% · 표 화면 구성 완료 · {time.perf_counter() - full_report_load_started:.1f}초 경과",
+                )
 
-            if visible_limit < min(filtered_total, max_rows):
-                next_limit = min(visible_limit + 200, max_rows, filtered_total)
+            selected_row = None
+            selected_report_number = str(
+                st.session_state.get("full_report_selected_number", "") or ""
+            )
+            if selected_report_number and "Report Number" in df.columns:
+                selected_matches = df[
+                    df["Report Number"].fillna("").astype(str) == selected_report_number
+                ]
+                if not selected_matches.empty:
+                    selected_row = selected_matches.iloc[0]
+
+            if has_more_rows and visible_limit < max_rows:
+                next_limit = min(visible_limit + 200, max_rows)
                 if st.button(f"더 보기 200건 ({next_limit:,}건까지)", key="full_report_load_more"):
                     st.session_state.full_report_rows_loaded = next_limit
                     st.rerun()
-            elif filtered_total > visible_limit:
+            elif has_more_rows:
                 st.caption("현재 표시 한도에 도달했습니다. 최대 표시 건수를 늘리면 더 많이 볼 수 있습니다.")
 
             # Excel 다운로드 버튼
@@ -4163,43 +5537,96 @@ if st.session_state.run_queries:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
 
-            # 개별 보고서 상세 보기
-            if len(df) > 0:
-                st.markdown("#### 개별 보고서 상세")
-                options = df["MAUDE 번호"].astype(str).tolist()
-                pick = st.selectbox("MAUDE 번호 선택", options=options, index=0)
-                if pick:
-                    row = df[df["MAUDE 번호"].astype(str) == pick].iloc[0]
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown(f"**EVENT_TYPE:** {row['EVENT_TYPE']}")
-                        _cat = row.get("DEVICE_CATEGORY") if hasattr(row, "get") else (row["DEVICE_CATEGORY"] if "DEVICE_CATEGORY" in row.index else None)
-                        _brand_line = f"**BRAND:** {row['BRAND_NAME']}"
-                        if _cat:
-                            _brand_line += f"  · 🩺 **{_cat}**"
-                        st.markdown(_brand_line)
-                        st.markdown(f"**MANUFACTURER:** {row['MANUFACTURER']} ({row['COUNTRY'] or 'N/A'})")
-                        st.markdown(f"**DATE_RECEIVED:** {row['DATE_RECEIVED']} · DATE_OF_EVENT: {row['DATE_OF_EVENT']}")
-                        st.markdown(
-                            f"**환자:** {row['SEX'] or '?'} · "
-                            f"{row['AGE'] or '?'} · "
-                            f"{row['RACE'] or '?'} · "
-                            f"{row['ETHNICITY'] or '?'}"
-                        )
-                    with c2:
-                        st.markdown(f"**[요약] 소비자 불만:** {row['[요약] 소비자 불만']}")
-                        st.markdown(f"**[요약] 제조사 대응:** {row['[요약] 제조사 대응']}")
-                        st.markdown(f"**[요약] 결론:** {row['[요약] 결론']}")
-
-                    # Problem code (Annex A / E) — 라벨과 코드 함께 표기
-                    he_val = row.get("HEALTH_EFFECT_CLINICAL_CODE") if hasattr(row, "get") else row["HEALTH_EFFECT_CLINICAL_CODE"]
-                    md_val = row.get("MEDICAL_DEVICE_PROBLEM_CODE") if hasattr(row, "get") else row["MEDICAL_DEVICE_PROBLEM_CODE"]
-                    st.markdown(
-                        f"**🧑 {PATIENT_PROBLEM_LABEL} (Annex E):** {he_val or '(없음)'}  \n"
-                        f"**⚙️ {DEVICE_PROBLEM_LABEL} (Annex A):** {md_val or '(없음)'}"
+            if filtered_total is None:
+                # 표를 먼저 그린 뒤에 정확한 전체 건수를 채운다.
+                if full_report_progress is not None:
+                    full_report_progress.progress(
+                        97,
+                        text=f"전체 보고서 로딩 97% · 전체 건수 계산 중 · {time.perf_counter() - full_report_load_started:.1f}초 경과",
                     )
+                filtered_total, filtered_total_exact = query_filtered_count(
+                    mtime, sel_brands_query, sel_events, date_from, date_to, keyword
+                )
+                _render_filtered_total(
+                    filtered_total_slot, filtered_total, filtered_total_exact
+                )
 
-                    _render_report_narratives(mtime, str(pick), row)
+            if full_report_progress is not None:
+                full_report_progress.progress(
+                    100,
+                    text=f"전체 보고서 로딩 100% · 완료 · 총 {time.perf_counter() - full_report_load_started:.1f}초",
+                )
+
+            # 개별 보고서 상세 보기
+            if len(df) > 0 and selected_row is None:
+                st.info("위 표의 '선택' 체크박스를 누르면 상세 내용과 원문을 표시합니다.")
+
+            if len(df) > 0 and selected_row is not None:
+                st.markdown("#### 개별 보고서 상세")
+                pick = _row_value(selected_row, "Report Number")
+                detail_row = query_report_detail(mtime, pick) if pick else None
+                row = detail_row if detail_row is not None else selected_row
+                pick = _row_value(row, "Report Number")
+                mdr_key = _row_value(row, "MDR Report Key")
+                raw_json = _row_value(row, "__RAW_JSON")
+                meta = _extract_report_metadata(raw_json)
+                type_of_report = _row_value(row, "Type of Report") or _row_value(row, "REPORT_STAGE") or meta.get("type_of_report", "")
+                report_status = meta.get("report_status") or ("초기 보고" if "initial" in type_of_report.lower() else "")
+                followup_count = meta.get("followup_count", "0")
+
+                st.caption(f"선택된 MDR Report Key: `{mdr_key or meta.get('mdr_report_key', '')}` · Report Number: `{pick or meta.get('report_number', '')}`")
+                c1, c2 = st.columns(2)
+                with c1:
+                    detail_metadata = pd.DataFrame(
+                        [
+                            ("MDR Report Key", mdr_key or meta.get("mdr_report_key", "")),
+                            ("Report Number", pick or meta.get("report_number", "")),
+                            ("Type of Report", type_of_report or "(없음)"),
+                            ("보고 상태", report_status or "(미상)"),
+                            ("후속 수정 횟수", f"{followup_count}회"),
+                            ("EVENT_TYPE", _row_value(row, "EVENT_TYPE")),
+                            ("BRAND", _row_value(row, "BRAND_NAME")),
+                            ("DEVICE_CATEGORY", _row_value(row, "DEVICE_CATEGORY")),
+                            (
+                                "MANUFACTURER",
+                                f"{_row_value(row, 'MANUFACTURER')} ({_row_value(row, 'COUNTRY') or 'N/A'})",
+                            ),
+                            ("DATE_RECEIVED", _row_value(row, "DATE_RECEIVED")),
+                            ("DATE_OF_EVENT", _row_value(row, "DATE_OF_EVENT")),
+                            ("Report Date (Section B)", meta.get("report_date_section_b") or _row_value(row, "DATE_REPORT")),
+                            ("제조사 최초 접수일", meta.get("initial_date_received_by_manufacturer") or "(없음)"),
+                            ("FDA 최초 접수일", meta.get("initial_report_fda_received_date") or _row_value(row, "DATE_RECEIVED")),
+                            (
+                                "환자",
+                                " · ".join(
+                                    _row_value(row, key) or "?"
+                                    for key in ("SEX", "AGE", "RACE", "ETHNICITY")
+                                ),
+                            ),
+                        ],
+                        columns=["항목", "내용"],
+                    )
+                    st.dataframe(detail_metadata, hide_index=True, use_container_width=True)
+                with c2:
+                    detail_summaries = pd.DataFrame(
+                        [
+                            ("소비자 불만", _row_value(row, "[요약] 소비자 불만")),
+                            ("제조사 대응", _row_value(row, "[요약] 제조사 대응")),
+                            ("결론", _row_value(row, "[요약] 결론")),
+                        ],
+                        columns=["요약", "내용"],
+                    )
+                    st.dataframe(detail_summaries, hide_index=True, use_container_width=True)
+
+                # Problem code (Annex A / E) — 라벨과 코드 함께 표기
+                he_val = row.get("HEALTH_EFFECT_CLINICAL_CODE") if hasattr(row, "get") else row["HEALTH_EFFECT_CLINICAL_CODE"]
+                md_val = row.get("MEDICAL_DEVICE_PROBLEM_CODE") if hasattr(row, "get") else row["MEDICAL_DEVICE_PROBLEM_CODE"]
+                st.markdown(
+                    f"**🧑 {PATIENT_PROBLEM_LABEL} (Annex E):** {he_val or '(없음)'}  \n"
+                    f"**⚙️ {DEVICE_PROBLEM_LABEL} (Annex A):** {md_val or '(없음)'}"
+                )
+
+                _render_report_narratives(mtime, pick, row)
 
             # 코드별 보고서 탐색 (드릴다운) — Insight (b) 와 동일한 split-view 패턴
             if len(df) > 0:
@@ -4512,11 +5939,13 @@ if st.session_state.run_queries:
                         if top_health_by_month.empty:
                             st.info("Health Effect 코드 데이터가 없습니다.")
                         else:
+                            st.caption("월은 행, 전체 기간 기준 상위 20개 코드는 열로 표시합니다.")
                             st.dataframe(top_health_by_month, use_container_width=True, hide_index=True, height=520)
                     with tab_device:
                         if top_device_by_month.empty:
                             st.info("Medical Device Problem Code 데이터가 없습니다.")
                         else:
+                            st.caption("월은 행, 전체 기간 기준 상위 20개 코드는 열로 표시합니다.")
                             st.dataframe(top_device_by_month, use_container_width=True, hide_index=True, height=520)
 
                     st.markdown("##### Health Effect × Medical Device Problem Code 연결표")
@@ -4649,7 +6078,9 @@ if st.session_state.run_queries:
         # ---------------- 탭 7: 월별 추이
         if page == "📈 월별 추이":
             st.subheader("월별 이벤트 유형 추이")
-            month_brand_candidates = sel_brands if sel_brands else display_brands
+            month_brand_candidates = _ordered_brand_names(
+                sel_brands if sel_brands else display_brands
+            )
             month_brand_options = ["전체(선택 브랜드 합계)"] + month_brand_candidates
             default_month_brand = (
                 sel_brands[0] if len(sel_brands) == 1 else "전체(선택 브랜드 합계)"
@@ -4689,8 +6120,14 @@ if st.session_state.run_queries:
             else:
                 df_trend = df_mon.set_index("월")
                 st.caption(f"현재 보기: {month_title}")
-                for metric in ["사망", "상해", "기타"]:
-                    st.markdown(f"###### {metric} 월별 추이")
+                trend_metrics = [
+                    ("사망", "사망"),
+                    ("상해", "상해"),
+                    ("오작동", "Malfunction"),
+                    ("기타", "기타"),
+                ]
+                for metric, display_name in trend_metrics:
+                    st.markdown(f"###### {display_name} 월별 추이")
                     single_df = df_trend.reset_index()[["월", metric]].copy()
                     chart_single = _build_smoothed_line_chart(
                         single_df,
@@ -4704,7 +6141,9 @@ if st.session_state.run_queries:
                 with st.expander("월별 원본 표"):
                     st.dataframe(df_trend, use_container_width=True)
 
-                compare_brands = sel_brands if sel_brands else display_brands
+                compare_brands = _ordered_brand_names(
+                    sel_brands if sel_brands else display_brands
+                )
                 if compare_brands:
                     st.markdown("##### 브랜드별 월별 비교")
                     overlap_brands = st.multiselect(
@@ -4765,7 +6204,6 @@ if st.session_state.run_queries:
                             brand_totals = (
                                 df_brand_mon.groupby("브랜드", as_index=False)["건수"]
                                 .sum()
-                                .sort_values("건수", ascending=False)
                             )
                             selected_overlap = [
                                 str(normalize_brand_value(b, MEMBER_TO_CANONICAL))
@@ -4777,7 +6215,9 @@ if st.session_state.run_queries:
                             if df_brand_mon.empty:
                                 st.info("선택한 브랜드 조합에서 표시할 데이터가 없습니다.")
                             else:
-                                brand_order = brand_totals[brand_totals["브랜드"].isin(df_brand_mon["브랜드"].unique())]["브랜드"].tolist()
+                                brand_order = _ordered_brand_names(
+                                    df_brand_mon["브랜드"].unique()
+                                )
                                 pivot_brand_mon = df_brand_mon.pivot_table(
                                     index="월",
                                     columns="브랜드",
@@ -4799,6 +6239,9 @@ if st.session_state.run_queries:
                                     y_cols=list(pivot_brand_mon.columns),
                                     title="건수",
                                     legend_orient=legend_orient,
+                                    series_colors=[
+                                        _brand_color(brand) for brand in brand_order
+                                    ],
                                 ).properties(height=320)
                                 chart_bar = _brand_month_bar_chart(
                                     chart_df,

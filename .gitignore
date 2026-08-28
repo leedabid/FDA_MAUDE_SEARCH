@@ -7,36 +7,48 @@ api_key.txt
 .env
 
 # ─────────────────────────────────────────────────────────────
-# Generated data & outputs (recreated by the collector/dashboard)
+# Large SQLite Databases & Journals (Stored locally only)
 # ─────────────────────────────────────────────────────────────
-fda_maude_cgm.db
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
-fda_maude_cgm.xlsx
+fda_maude_cgm*.db
+fda_maude_cgm*.db-*
+
+# ─────────────────────────────────────────────────────────────
+# Generated Data & Large Exports / Archives
+# ─────────────────────────────────────────────────────────────
+*.xlsx
+*.xls
+*.csv
+*.zip
+*.tar.gz
+Dexcom_libre_*.xlsx
 maude_full_dashboard_*.xlsx
 maude_insight_report_*.xlsx
+fda-annexes-*.xlsx
+
+# ─────────────────────────────────────────────────────────────
+# Local Logs & Caches
+# ─────────────────────────────────────────────────────────────
 *.log
-
-# Personal / local analysis files (not part of the tool)
-Dexcom_libre_*.xlsx
-
-# Internal AI handoff doc — contains local machine paths/username, keep local only
-HANDOFF.md
-
-# Temporary working dirs
-tmp_maude_xlsx_unzip/
-tmp/
-temp/
+.maude_filter_metadata_cache.json*
+user_bookmarks.json
 
 # ─────────────────────────────────────────────────────────────
-# Backup / old script versions (kept locally, not published)
+# Node.js & Frontend Build Outputs
 # ─────────────────────────────────────────────────────────────
-*복사본*.py
-raw_maude_dashboard.py
+node_modules/
+frontend/node_modules/
+dist/
+frontend/dist/
+.vite/
 
 # ─────────────────────────────────────────────────────────────
-# Python
+# Python & Virtual Environments
 # ─────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -46,11 +58,18 @@ venv/
 env/
 .Python
 build/
-dist/
 *.egg-info/
 
 # ─────────────────────────────────────────────────────────────
-# Editors / OS
+# Temporary Working Dirs
+# ─────────────────────────────────────────────────────────────
+tmp_maude_xlsx_unzip/
+tmp/
+temp/
+codex_maude_refactor_tasks/
+
+# ─────────────────────────────────────────────────────────────
+# Editors & System Files
 # ─────────────────────────────────────────────────────────────
 .vscode/
 .idea/
@@ -59,3 +78,4 @@ dist/
 *.swp
 .DS_Store
 Thumbs.db
+HANDOFF.md

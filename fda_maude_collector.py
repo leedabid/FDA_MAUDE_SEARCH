@@ -34,6 +34,7 @@ FDA openFDA API(MAUDE)에서 수집하여 SQLite DB와 Excel 파일로 저장합
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -171,15 +172,14 @@ def _resolve_device_category(brand_name: Optional[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # FDA MAUDE 의 event_type 은 5가지: Death / Injury / Malfunction / Other /
 # "No answer provided". Dexcom · Libre 는 "Malfunction"(단순 센서 오작동)
-# 보고가 연간 수십만 건이라, 환자 피해 사례(Death/Injury/Other)만 수집
-# 하는 것을 기본값으로 합니다.
-#
-# Malfunction 까지 포함하고 싶으면 아래 리스트에 "Malfunction" 을 추가하세요.
+# 보고가 연간 수십만 건이라 예전에는 환자 피해 사례 위주로 좁히기도 했지만,
+# 웹 MAUDE 와 최대한 맞추기 위해 기본값은 전체 이벤트 타입으로 둡니다.
 EVENT_TYPES: List[str] = [
     "Death",
     "Injury",
     "Other",
-    # "Malfunction",   # ← 주석 해제 시 오작동 보고까지 포함 (건수 폭증 주의)
+    "Malfunction",
+    "No answer provided",
 ]
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ EVENT_TYPES: List[str] = [
 # True 로 하면 "환자에게 실제로 부작용이 발생한 보고"만 가져옵니다.
 # (adverse_event_flag = Y). 단순 기기 결함 보고는 제외됩니다.
 # False 로 하면 플래그 무관 전체 수집.
-ONLY_ADVERSE_EVENTS: bool = True
+ONLY_ADVERSE_EVENTS: bool = False
 
 # ---------------------------------------------------------------------------
 # [설정 4] 보조 필드로도 검색할지 여부
@@ -314,6 +314,7 @@ CREATE TABLE IF NOT EXISTS maude_reports (
     summary_response_kr    TEXT,                -- 한글 요약: 제조사 대응
     summary_conclusion_kr  TEXT,                -- 한글 요약: 결론
     raw_json               TEXT,                -- 원본 JSON (디버깅용)
+    record_hash            TEXT,                -- 레코드 변경 감지용 해시(SHA-256)
     collected_at           TEXT                 -- 수집 시각
 );
 
@@ -327,6 +328,11 @@ CREATE TABLE IF NOT EXISTS collection_checkpoint (
     first_run_at        TEXT,              -- 최초 실행 시각 (참고)
     note                TEXT               -- 비고 (예: "최초 2년치 수집")
 );
+
+CREATE TABLE IF NOT EXISTS collector_state (
+    state_key   TEXT PRIMARY KEY,
+    state_value TEXT
+);
 """
 
 SCHEMA_INDEXES_SQL = """
@@ -339,6 +345,7 @@ CREATE INDEX IF NOT EXISTS idx_date_received   ON maude_reports(date_received);
 CREATE INDEX IF NOT EXISTS idx_product_code    ON maude_reports(product_code);
 CREATE INDEX IF NOT EXISTS idx_patient_sex     ON maude_reports(patient_sex);
 CREATE INDEX IF NOT EXISTS idx_type_of_report  ON maude_reports(type_of_report);
+CREATE INDEX IF NOT EXISTS idx_mdr_report_key  ON maude_reports(mdr_report_key);
 CREATE INDEX IF NOT EXISTS idx_reports_date
     ON maude_reports(date_received);
 CREATE INDEX IF NOT EXISTS idx_reports_event
@@ -568,6 +575,15 @@ class APIKeyRequired(Exception):
     pass
 
 
+class WindowFetchError(Exception):
+    """특정 날짜 창을 끝까지 못 읽었을 때 상위에서 더 잘게 쪼개기 위한 예외."""
+
+    def __init__(self, window_start: datetime, window_end: datetime, message: str):
+        super().__init__(message)
+        self.window_start = window_start
+        self.window_end = window_end
+
+
 def _parse_date_yyyymmdd(s: Optional[str]) -> Optional[datetime]:
     """openFDA 의 'YYYYMMDD' 문자열을 datetime 으로."""
     if not s:
@@ -609,11 +625,12 @@ def _fetch_page(
             resp = session.get(url, timeout=REQUEST_TIMEOUT)
         except requests.RequestException as e:
             retries += 1
-            if retries > 3:
+            if retries > 4:
                 log.error("  요청 실패 3회 초과: %s", e)
                 return 0, []
-            log.warning("  요청 실패 (%d/3): %s — 5초 후 재시도", retries, e)
-            time.sleep(5)
+            wait = min(30, 5 * retries)
+            log.warning("  요청 실패 (%d/4): %s — %d초 후 재시도", retries, e, wait)
+            time.sleep(wait)
             continue
 
         if resp.status_code == 200:
@@ -622,8 +639,9 @@ def _fetch_page(
             # openFDA 는 결과 없음 = 404 반환
             return 404, []
         if resp.status_code == 429:
-            log.warning("  속도 제한(429). 60초 대기.")
-            time.sleep(60)
+            wait = min(120, 30 * (retries + 1))
+            log.warning("  속도 제한(429). %d초 대기.", wait)
+            time.sleep(wait)
             continue
         if resp.status_code == 403:
             txt = resp.text[:300]
@@ -633,11 +651,12 @@ def _fetch_page(
             return 403, []
         if 500 <= resp.status_code < 600:
             retries += 1
-            if retries > 3:
+            if retries > 4:
                 log.error("  HTTP %d 지속: %s", resp.status_code, resp.text[:200])
                 return resp.status_code, []
-            log.warning("  HTTP %d (%d/3). 10초 후 재시도.", resp.status_code, retries)
-            time.sleep(10)
+            wait = min(60, 10 * retries)
+            log.warning("  HTTP %d (%d/4). %d초 후 재시도.", resp.status_code, retries, wait)
+            time.sleep(wait)
             continue
         log.error("  HTTP %d: %s", resp.status_code, resp.text[:300])
         return resp.status_code, []
@@ -684,8 +703,11 @@ def _fetch_cursor_window(
                 # 이 창은 여기까지
                 return
             if status != 200:
-                # 회복 불가 에러: 바깥 for 문이 다음 창으로 진행하지 않도록 종료
-                return
+                raise WindowFetchError(
+                    cur_start,
+                    window_end,
+                    f"window fetch failed with status={status}",
+                )
 
             for ev in results:
                 yield ev
@@ -706,7 +728,11 @@ def _fetch_cursor_window(
                     log.warning(
                         "  ⚠ skip 한도 도달했지만 last_date_received 파싱 실패. 중단."
                     )
-                    return
+                    raise WindowFetchError(
+                        cur_start,
+                        window_end,
+                        "skip limit reached but could not parse last_date_received",
+                    )
                 # 같은 날짜 레코드가 더 있을 수 있으니 +0일이 아닌 현재 날짜부터 재시작.
                 # (PRIMARY KEY 로 중복 자동 배제됨)
                 next_start = parsed
@@ -724,6 +750,50 @@ def _fetch_cursor_window(
 
             time.sleep(page_sleep)
         # continue outer while: 새 window 로 재진입
+
+
+def _month_start(dt: datetime) -> datetime:
+    return datetime(dt.year, dt.month, 1)
+
+
+def _next_month(dt: datetime) -> datetime:
+    if dt.month == 12:
+        return datetime(dt.year + 1, 1, 1)
+    return datetime(dt.year, dt.month + 1, 1)
+
+
+def _split_date_windows(start: datetime, end: datetime) -> List[Tuple[datetime, datetime]]:
+    """날짜 범위를 월 단위 창으로 쪼갠다."""
+    windows: List[Tuple[datetime, datetime]] = []
+    cur = _month_start(start)
+    while cur <= end:
+        nxt = _next_month(cur)
+        window_start = max(start, cur)
+        window_end = min(end, nxt - timedelta(days=1))
+        if window_start <= window_end:
+            windows.append((window_start, window_end))
+        cur = nxt
+    return windows
+
+
+def _split_window_halves(window_start: datetime, window_end: datetime) -> List[Tuple[datetime, datetime]]:
+    """실패한 창을 두 개로 나눈다. 1일 창이면 더 못 쪼갠다."""
+    if window_start >= window_end:
+        return [(window_start, window_end)]
+    mid = window_start + (window_end - window_start) / 2
+    mid_day = datetime(mid.year, mid.month, mid.day)
+    if mid_day <= window_start:
+        mid_day = window_start + timedelta(days=1)
+    left_end = mid_day - timedelta(days=1)
+    if left_end < window_start:
+        left_end = window_start
+    right_start = mid_day
+    if right_start > window_end:
+        right_start = window_end
+    parts: List[Tuple[datetime, datetime]] = [(window_start, left_end)]
+    if right_start <= window_end:
+        parts.append((right_start, window_end))
+    return parts
 
 
 def fetch_events(
@@ -796,11 +866,33 @@ def fetch_events(
         return
 
     session = requests.Session()
-    log.info("커서 기반 수집 시작 (sort=date_received:asc, 한도 우회 가능)")
+    log.info("월 단위 커서 기반 수집 시작 (sort=date_received:asc, 한도 우회 가능)")
 
-    yield from _fetch_cursor_window(
-        chosen_primary, start, end, api_key, verbose, session
-    )
+    windows = _split_date_windows(start, end)
+    for window_start, window_end in windows:
+        stack: List[Tuple[datetime, datetime]] = [(window_start, window_end)]
+        while stack:
+            cur_start, cur_end = stack.pop(0)
+            try:
+                yield from _fetch_cursor_window(
+                    chosen_primary, cur_start, cur_end, api_key, verbose, session
+                )
+            except WindowFetchError as e:
+                if e.window_start >= e.window_end:
+                    log.warning(
+                        "  ⚠ 1일 창도 실패해 건너뜁니다: %s",
+                        e.window_start.strftime("%Y-%m-%d"),
+                    )
+                    continue
+                parts = _split_window_halves(e.window_start, e.window_end)
+                log.warning(
+                    "  ↯ 창 실패로 재분할: %s ~ %s -> %d개 창",
+                    e.window_start.strftime("%Y-%m-%d"),
+                    e.window_end.strftime("%Y-%m-%d"),
+                    len(parts),
+                )
+                # 실패한 창만 더 잘게 쪼개서 다시 시도
+                stack = parts + stack
 
     log.info("수집 종료.")
 
@@ -882,6 +974,12 @@ def _join_narrative_parts(parts: List[str]) -> Optional[str]:
     return "\n\n".join(f"[{i}] {txt}" for i, txt in enumerate(cleaned, start=1))
 
 
+def _event_record_hash(ev: Dict[str, Any]) -> str:
+    """원본 이벤트 payload 의 내용 변경 감지를 위한 안정적인 SHA-256 해시."""
+    canonical = json.dumps(ev, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
     """openFDA MAUDE 이벤트 JSON 을 평탄화된 dict 로 변환."""
     devices = ev.get("device", []) or []
@@ -917,8 +1015,10 @@ def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
             event_desc_parts.append(txt)
 
     report_number = ev.get("report_number") or ev.get("mdr_report_key") or ""
+    mdr_report_key = ev.get("mdr_report_key") or report_number
 
     return {
+        "mdr_report_key": str(mdr_report_key),
         "report_number": str(report_number),
         "event_type": ev.get("event_type"),
         "date_received": _normalize_date(ev.get("date_received")),
@@ -949,6 +1049,7 @@ def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         "manufacturer_narrative": _join_narrative_parts(mfr_narr_parts),
         "additional_manufacturer_narrative": _join_narrative_parts(add_mfr_narr_parts),
         "raw_json": json.dumps(ev, ensure_ascii=False),
+        "record_hash": _event_record_hash(ev),
     }
 
 
@@ -960,6 +1061,7 @@ def flatten_event(ev: Dict[str, Any]) -> Dict[str, Any]:
 # 구 DB 마이그레이션 시, 여기에 있는데 실제 DB 에 없는 칼럼은 ALTER TABLE 로 추가한다.
 # (report_number 은 PRIMARY KEY 이므로 여기에 넣지 않는다 — 반드시 있어야 함)
 _TARGET_COLUMNS: List[Tuple[str, str]] = [
+    ("mdr_report_key",          "TEXT"),
     ("event_type",             "TEXT"),
     ("date_received",          "TEXT"),
     ("date_of_event",          "TEXT"),
@@ -988,6 +1090,7 @@ _TARGET_COLUMNS: List[Tuple[str, str]] = [
     ("summary_response_kr",    "TEXT"),
     ("summary_conclusion_kr",  "TEXT"),
     ("raw_json",               "TEXT"),
+    ("record_hash",            "TEXT"),
     ("collected_at",           "TEXT"),
 ]
 
@@ -1006,7 +1109,42 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         if col not in existing:
             log.info("DB 마이그레이션: maude_reports.%s 칼럼 추가", col)
             conn.execute(f"ALTER TABLE maude_reports ADD COLUMN {col} {ctype}")
+    if "mdr_report_key" in existing or any(col == "mdr_report_key" for col, _ in _TARGET_COLUMNS):
+        _backfill_mdr_report_key(conn)
     conn.commit()
+
+
+def _backfill_mdr_report_key(conn: sqlite3.Connection) -> None:
+    """기존 DB 행의 raw_json 에서 MDR Report Key 를 복원한다."""
+    try:
+        rows = conn.execute(
+            """
+            SELECT report_number, raw_json
+            FROM maude_reports
+            WHERE COALESCE(mdr_report_key, '') = ''
+              AND COALESCE(raw_json, '') <> ''
+            """
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    if not rows:
+        return
+
+    updates = []
+    for report_number, raw_json in rows:
+        mdr_key = ""
+        try:
+            payload = json.loads(raw_json)
+            mdr_key = str(payload.get("mdr_report_key") or "").strip()
+        except Exception:
+            mdr_key = ""
+        if mdr_key:
+            updates.append((mdr_key, report_number))
+    if updates:
+        conn.executemany(
+            "UPDATE maude_reports SET mdr_report_key = ? WHERE report_number = ?",
+            updates,
+        )
 
 
 def _normalize_match_text(value: Optional[object]) -> str:
@@ -1176,6 +1314,25 @@ def get_checkpoint(conn: sqlite3.Connection, brands: List[str]) -> Optional[Dict
     }
 
 
+def get_state(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT state_value FROM collector_state WHERE state_key = ?",
+        (key,),
+    ).fetchone()
+    if not row:
+        return None
+    return row[0]
+
+
+def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO collector_state(state_key, state_value) VALUES (?, ?) "
+        "ON CONFLICT(state_key) DO UPDATE SET state_value = excluded.state_value",
+        (key, value),
+    )
+    conn.commit()
+
+
 def save_checkpoint(
     conn: sqlite3.Connection,
     brands: List[str],
@@ -1252,8 +1409,23 @@ def upsert_report(conn: sqlite3.Connection, row: Dict[str, Any]) -> bool:
     row["summary_conclusion_kr"] = conclusion_kr
     row["collected_at"] = datetime.now().isoformat(timespec="seconds")
 
+    existing_hash_row = conn.execute(
+        "SELECT record_hash FROM maude_reports WHERE report_number = ?",
+        (row["report_number"],),
+    ).fetchone()
+    existing_hash = existing_hash_row[0] if existing_hash_row else None
+
+    # 같은 report_number 가 다시 들어오더라도 내용이 완전히 같으면
+    # 본문 필드는 건드리지 않고 수집시각만 갱신해 재수집 흔적만 남긴다.
+    if existing_hash and row.get("record_hash") and existing_hash == row["record_hash"]:
+        conn.execute(
+            "UPDATE maude_reports SET collected_at = ? WHERE report_number = ?",
+            (row["collected_at"], row["report_number"]),
+        )
+        return False
+
     columns = [
-        "report_number", "event_type", "date_received", "date_of_event", "date_report",
+        "mdr_report_key", "report_number", "event_type", "date_received", "date_of_event", "date_report",
         "brand_name", "device_category", "generic_name", "manufacturer_name", "manufacturer_country",
         "model_number", "product_code",
         "source_type", "report_source_code",
@@ -1262,7 +1434,7 @@ def upsert_report(conn: sqlite3.Connection, row: Dict[str, Any]) -> bool:
         "patient_problems", "product_problems",
         "event_description", "manufacturer_narrative", "additional_manufacturer_narrative",
         "summary_complaint_kr", "summary_response_kr", "summary_conclusion_kr",
-        "raw_json", "collected_at",
+        "raw_json", "record_hash", "collected_at",
     ]
     placeholders = ",".join(["?"] * len(columns))
     colnames = ",".join(columns)
@@ -1284,7 +1456,8 @@ def upsert_report(conn: sqlite3.Connection, row: Dict[str, Any]) -> bool:
 
 # 전체 보고서 시트 칼럼 정의 (라벨, SQL 표현식)
 _EXCEL_MAIN_COLUMNS: List[Tuple[str, str]] = [
-    ("MAUDE 번호", "report_number"),
+    ("MDR Report Key", "mdr_report_key"),
+    ("Report Number", "report_number"),
     ("EVENT_TYPE", "event_type"),
     ("DATE_RECEIVED", "date_received"),
     ("DATE_OF_EVENT", "date_of_event"),
@@ -1349,6 +1522,17 @@ def export_excel(conn: sqlite3.Connection, path: Path = EXCEL_PATH) -> None:
         from openpyxl.utils import get_column_letter
     except ImportError:
         log.error("Excel 내보내기에는 openpyxl 이 필요합니다. 'pip install openpyxl' 실행.")
+        return
+
+    EXCEL_MAX_ROWS = 1_048_576
+    try:
+        n_rows = conn.execute("SELECT COUNT(*) FROM maude_reports").fetchone()[0]
+    except Exception:  # noqa: BLE001
+        n_rows = 0
+    if n_rows >= EXCEL_MAX_ROWS:
+        log.error(
+            "Excel 내보내기 중단: 보고서 %d건이 Excel 시트 상한 %d행을 넘습니다. "
+            "DB(SQLite) 나 대시보드를 사용하세요.", n_rows, EXCEL_MAX_ROWS)
         return
 
     wb = Workbook(write_only=True)
@@ -1557,35 +1741,45 @@ def run_test_mode(api_key: Optional[str]) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="FDA MAUDE CGM 수집기 (체크포인트 기반 자동 증분 수집)",
+        description="FDA MAUDE CGM 수집기 (월 1회 최근 N년 갱신, N=--initial-years)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 자동 수집 로직:
-  1) 최초 실행 (체크포인트 없음) → 최근 2년치 조회 + 체크포인트 저장
-  2) 이후 실행 → 체크포인트 저장일 - 1일(겹침) 부터 오늘까지 조회 → 체크포인트 갱신
-  3) CGM_BRANDS 목록이 바뀌면 자동으로 "최초 실행" 모드로 전환됨
-     (새 브랜드 조합 = 새 체크포인트)
+  1) 기본 실행 → 최근 N년치(--initial-years, 기본 1)를 다시 조회해 UPSERT (기존 데이터는 삭제하지 않음)
+  2) --incremental 옵션 → 기존 체크포인트 기반 증분 수집
+  3) --start / --end 옵션 → 수동 범위 수집 (DB 갱신은 하되 체크포인트는 건드리지 않음)
 
 예시:
-  python fda_maude_collector.py              # 위 자동 로직 (권장)
+  python fda_maude_collector.py              # 최근 N년 갱신 (권장)
+  python fda_maude_collector.py --force-refresh # 이번 달에도 강제로 전체 재수집
+  python fda_maude_collector.py --incremental # 예전 방식의 증분 수집
   python fda_maude_collector.py --test       # API 연결 진단
-  python fda_maude_collector.py --initial    # 강제로 최초 모드 (2년 재수집)
+  python fda_maude_collector.py --initial    # 강제로 최근 N년 재수집
   python fda_maude_collector.py --start 20240101 --end 20251130  # 기간 수동 지정
   python fda_maude_collector.py --export-only # DB만으로 Excel 재생성
   python fda_maude_collector.py --verbose    # 상세 URL 로그
 """)
     parser.add_argument("--start", help="조회 시작일 YYYYMMDD (수동 지정, 체크포인트 갱신 안 함)")
     parser.add_argument("--end", help="조회 종료일 YYYYMMDD (수동 지정)")
+    parser.add_argument("--incremental", action="store_true",
+                        help="기존 방식의 체크포인트 기반 증분 수집")
+    parser.add_argument("--force-refresh", action="store_true",
+                        help="월 1회 제한을 무시하고 최근 N년 갱신을 강제로 실행")
     parser.add_argument("--initial", action="store_true",
-                        help="강제 최초 모드: 체크포인트 무시하고 최근 2년 재수집")
-    parser.add_argument("--initial-years", type=int, default=5,
-                        help="최초 실행 시 과거 N년치 수집 (기본 2)")
+                        help="강제 갱신 모드: 최근 N년치 재조회")
+    parser.add_argument("--initial-years", type=int, default=1,
+                        help="갱신 시 과거 N년치를 다시 조회 (기본 1). 기존 데이터를 "
+                             "지우지 않고 UPSERT 하므로, 이 값보다 오래된 데이터도 "
+                             "DB 에 그대로 남는다.")
     parser.add_argument("--overlap-days", type=int, default=1,
                         help="증분 시 이전 체크포인트와 겹칠 일수 (기본 1)")
     parser.add_argument("--api-key", default=None,
                         help="openFDA API 키 (환경변수 OPENFDA_API_KEY 또는 api_key.txt 파일도 가능)")
     parser.add_argument("--db", default=str(DB_PATH), help="SQLite 경로")
     parser.add_argument("--excel", default=str(EXCEL_PATH), help="Excel 출력 경로")
+    parser.add_argument("--export-excel", action="store_true",
+                        help="수집 후 xlsx 자동 내보내기 (기본 꺼짐). Excel 시트 상한은 "
+                             "1,048,576행이라 DB 가 그보다 크면 실패한다.")
     parser.add_argument("--export-only", action="store_true",
                         help="DB 수집 없이 현재 DB로 Excel만 재생성")
     parser.add_argument("--test", action="store_true",
@@ -1617,27 +1811,41 @@ def main() -> int:
     excel_path = Path(args.excel)
     today = datetime.now()
 
-    # DB 초기화 후 체크포인트 확인
+    # DB 초기화
     conn = init_db(db_path)
-    checkpoint = get_checkpoint(conn, CGM_BRANDS)
 
-    # 고장난 체크포인트 자동 무효화:
-    # total_collected=0 이면 이전 실행에서 실질적으로 아무 것도 못 가져온 것.
-    # (예: API 키 부재 → 403, 필터 에러, 네트워크 실패 등)
-    # 이 체크포인트를 따라가면 "하루 2일치만 재시도" 같은 허무한 실행이 반복됨.
-    # → 강제로 최초 수집 모드로 떨어뜨리고 기존 레코드는 삭제하여 재시도.
-    if checkpoint and (checkpoint.get("total_collected") or 0) == 0:
+    monthly_refresh_due = False
+    if not args.incremental and not args.start and not args.end:
+        last_full_refresh_at = get_state(conn, "last_full_refresh_at")
+        current_month = today.strftime("%Y-%m")
+        last_refresh_month = ""
+        if last_full_refresh_at:
+            try:
+                last_refresh_month = datetime.fromisoformat(last_full_refresh_at).strftime("%Y-%m")
+            except Exception:
+                last_refresh_month = ""
+        monthly_refresh_due = args.force_refresh or (last_refresh_month != current_month)
+        if not monthly_refresh_due:
+            log.info("=" * 60)
+            log.info("이번 달(%s)은 이미 최근 %d년 갱신이 완료되어 있습니다.",
+                     current_month, args.initial_years)
+            log.info("월 1회만 수행하도록 설정되어 있어 이번 실행은 건너뜁니다.")
+            log.info("강제로 다시 실행하려면 `--force-refresh` 를 사용하세요.")
+            log.info("=" * 60)
+            conn.close()
+            return 0
         log.warning("=" * 60)
-        log.warning("이전 체크포인트가 비정상 (수집 0건):")
-        log.warning("  last_search_end = %s", checkpoint.get("last_search_end"))
-        log.warning("  last_run_at     = %s", checkpoint.get("last_run_at"))
-        log.warning("  note            = %s", checkpoint.get("note"))
-        log.warning("→ 이 체크포인트를 무효화하고 최초 수집 모드로 재시도합니다.")
+        log.warning("월 1회 최근 %d년 갱신을 시작합니다.", args.initial_years)
+        if last_full_refresh_at:
+            log.warning("마지막 갱신 시각: %s", last_full_refresh_at)
+        log.warning("기존 데이터는 삭제하지 않습니다. report_number 기준 UPSERT 로 "
+                    "새 보고서는 추가하고 기존 보고서는 갱신합니다.")
+        log.warning("따라서 갱신 창(최근 %d년) 보다 오래된 데이터도 그대로 보존됩니다.",
+                    args.initial_years)
         log.warning("=" * 60)
-        key = _brand_key(CGM_BRANDS)
-        conn.execute("DELETE FROM collection_checkpoint WHERE brand_key = ?", (key,))
-        conn.commit()
-        checkpoint = None
+
+    checkpoint = get_checkpoint(conn, CGM_BRANDS) if args.incremental else None
+    latest_db_date = get_latest_date_received(conn) if args.incremental else None
 
     # --- 조회 기간 결정 ---
     manual_range = False
@@ -1651,23 +1859,30 @@ def main() -> int:
         manual_range = True
         mode_note = f"수동 범위: {args.start} ~ {args.end}"
 
-    elif args.initial or checkpoint is None:
-        # (B) 강제 최초 모드 OR 체크포인트 없음 → 최근 N년치
+    elif args.initial or not args.incremental:
+        # (B) 기본 모드 또는 강제 갱신 → 최근 N년치 재조회 (기존 데이터는 유지)
         end = today
         start = today - timedelta(days=365 * args.initial_years)
         is_initial_run = True
         if args.initial:
-            mode_note = f"강제 초기 수집 ({args.initial_years}년)"
+            mode_note = f"강제 갱신 ({args.initial_years}년)"
         else:
-            mode_note = f"최초 실행: {args.initial_years}년치 일괄 수집"
+            mode_note = f"기본 갱신: 최근 {args.initial_years}년치 재조회 (기존 데이터 유지)"
 
     else:
-        # (C) 체크포인트 있음 → 증분 수집 (이전 종료일 - overlap 부터 오늘까지)
-        last_end = datetime.strptime(checkpoint["last_search_end"], "%Y-%m-%d")
-        start = last_end - timedelta(days=args.overlap_days)
+        # (C) 증분 수집 → DB 에 실제 저장된 마지막 date_received 기준으로 재조회
+        #     FDA 반영 지연을 고려해 overlap_days 만큼 겹쳐서 오늘까지 조회한다.
+        if latest_db_date is not None:
+            base_date = latest_db_date
+            base_note = f"DB 마지막 날짜 {latest_db_date.strftime('%Y-%m-%d')}"
+        else:
+            base_date = datetime.strptime(checkpoint["last_search_end"], "%Y-%m-%d")
+            base_note = f"체크포인트 종료일 {checkpoint['last_search_end']}"
+
+        start = base_date - timedelta(days=args.overlap_days)
         end = today
         mode_note = (
-            f"증분 수집 (이전 종료일 {checkpoint['last_search_end']} "
+            f"증분 수집 ({base_note} "
             f"- {args.overlap_days}일 겹침 → 오늘)"
         )
 
@@ -1682,7 +1897,11 @@ def main() -> int:
                  checkpoint["total_collected"] or 0,
                  checkpoint["last_run_at"])
     else:
-        log.info("이전 체크포인트: 없음 (최초 실행)")
+        log.info("이전 체크포인트: 없음")
+    if latest_db_date is not None:
+        log.info("DB 최신 date_received: %s", latest_db_date.strftime("%Y-%m-%d"))
+    else:
+        log.info("DB 최신 date_received: 없음")
     log.info("조회 기간: %s ~ %s", start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
     log.info("부작용 필터: EVENT_TYPE in %s | adverse_event_flag=%s",
              EVENT_TYPES or "(제한 없음)",
@@ -1692,6 +1911,7 @@ def main() -> int:
 
     inserted = 0
     errors = 0
+    updated = 0
     api_key_issue = False
     try:
         try:
@@ -1700,11 +1920,16 @@ def main() -> int:
                     row = flatten_event(ev)
                     if not row["report_number"]:
                         continue
-                    upsert_report(conn, row)
-                    inserted += 1
-                    if inserted % 100 == 0:
+                    changed = upsert_report(conn, row)
+                    if changed:
+                        inserted += 1
+                        if inserted % 100 == 0:
+                            conn.commit()
+                            log.info("진행: %d건 저장", inserted)
+                    else:
+                        updated += 1
+                    if (inserted + updated) % 100 == 0:
                         conn.commit()
-                        log.info("진행: %d건 저장", inserted)
                 except Exception as e:  # noqa: BLE001
                     errors += 1
                     log.exception("이벤트 처리 실패: %s", e)
@@ -1721,7 +1946,7 @@ def main() -> int:
             log.error("=" * 60)
         conn.commit()
     finally:
-        log.info("DB 저장 완료 (신규/갱신: %d, 오류: %d)", inserted, errors)
+        log.info("DB 저장 완료 (변경 반영: %d, 동일 기록 재확인: %d, 오류: %d)", inserted, updated, errors)
 
         # 체크포인트 갱신 정책:
         #  (A) 수동 범위 모드 → 저장 안 함
@@ -1739,37 +1964,50 @@ def main() -> int:
         if skip_reason:
             log.warning("체크포인트 갱신 안 함 (%s). 다음 실행 시 같은 범위 재시도.", skip_reason)
         else:
-            checkpoint_end = end
-            note_text = "최초 수집" if is_initial_run else "증분 수집"
+            if not args.incremental:
+                log.info("기본 갱신 모드에서는 체크포인트를 저장하지 않습니다.")
+            else:
+                checkpoint_end = end
+                note_text = "최초 수집" if is_initial_run else "증분 수집"
 
-            # 증분 수집에서 0건이면 "오늘"로 전진하지 않고,
-            # DB 에 실제 존재하는 마지막 date_received 를 체크포인트로 유지.
-            if (not is_initial_run) and inserted == 0:
-                latest_db_date = get_latest_date_received(conn)
-                if latest_db_date is not None:
-                    checkpoint_end = latest_db_date
-                    note_text = "증분 수집 (0건: DB 마지막 날짜 유지)"
-                    log.info(
-                        "증분 0건: 체크포인트를 조회 종료일(%s) 대신 DB 마지막 날짜(%s)로 유지",
-                        end.strftime("%Y-%m-%d"),
-                        checkpoint_end.strftime("%Y-%m-%d"),
-                    )
-                else:
-                    log.warning(
-                        "증분 0건 + DB 마지막 date_received 없음: 체크포인트를 조회 종료일(%s)로 저장",
-                        end.strftime("%Y-%m-%d"),
-                    )
+                # 증분 수집에서 0건이면 "오늘"로 전진하지 않고,
+                # DB 에 실제 존재하는 마지막 date_received 를 체크포인트로 유지.
+                if (not is_initial_run) and inserted == 0:
+                    latest_db_date = get_latest_date_received(conn)
+                    if latest_db_date is not None:
+                        checkpoint_end = latest_db_date
+                        note_text = "증분 수집 (0건: DB 마지막 날짜 유지)"
+                        log.info(
+                            "증분 0건: 체크포인트를 조회 종료일(%s) 대신 DB 마지막 날짜(%s)로 유지",
+                            end.strftime("%Y-%m-%d"),
+                            checkpoint_end.strftime("%Y-%m-%d"),
+                        )
+                    else:
+                        log.warning(
+                            "증분 0건 + DB 마지막 date_received 없음: 체크포인트를 조회 종료일(%s)로 저장",
+                            end.strftime("%Y-%m-%d"),
+                        )
 
-            save_checkpoint(conn, CGM_BRANDS, checkpoint_end, inserted, note=note_text)
-            log.info("체크포인트 저장: last_search_end=%s (다음 실행은 %s 부터)",
-                     checkpoint_end.strftime("%Y-%m-%d"),
-                     (checkpoint_end - timedelta(days=args.overlap_days)).strftime("%Y-%m-%d"))
+                save_checkpoint(conn, CGM_BRANDS, checkpoint_end, inserted, note=note_text)
+                log.info("체크포인트 저장: last_search_end=%s (다음 실행은 %s 부터)",
+                         checkpoint_end.strftime("%Y-%m-%d"),
+                         (checkpoint_end - timedelta(days=args.overlap_days)).strftime("%Y-%m-%d"))
 
-        # Excel 내보내기
-        try:
-            export_excel(conn, excel_path)
-        except Exception as e:  # noqa: BLE001
-            log.exception("Excel 내보내기 실패: %s", e)
+        if monthly_refresh_due and not args.incremental and not manual_range:
+            set_state(conn, "last_full_refresh_at", datetime.now().isoformat(timespec="seconds"))
+            log.info("월간 갱신 완료 시각 저장: %s", get_state(conn, "last_full_refresh_at"))
+
+        # Excel 내보내기 (기본 꺼짐)
+        # DB 가 Excel 시트 상한(1,048,576행)을 넘어서면 내보내기가 실패하므로,
+        # 매 수집마다 수십 분을 헛돌지 않도록 명시 요청할 때만 실행한다.
+        if args.export_excel:
+            try:
+                export_excel(conn, excel_path)
+            except Exception as e:  # noqa: BLE001
+                log.exception("Excel 내보내기 실패: %s", e)
+        else:
+            log.info("Excel 자동 내보내기 생략 (필요하면 --export-excel 또는 "
+                     "--export-only 사용).")
         conn.close()
 
     total = sqlite3.connect(db_path).execute("SELECT COUNT(*) FROM maude_reports").fetchone()[0]

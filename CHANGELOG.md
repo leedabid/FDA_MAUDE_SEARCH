@@ -4,6 +4,17 @@ Notable changes to the FDA MAUDE CGM dashboard (`maude_dashboard.py`).
 Newest entries first.
 
 ---
+## 2026-08-11
+
+### [Performance/UI] Faster startup and immediately visible navigation
+
+- The launcher now selects an already prepared Python runtime and disables the Streamlit file watcher.
+- Brand and category filter metadata uses the compact monthly summary table plus a DB-signature disk cache.
+- The brand-group checkbox editor is loaded only on demand instead of constructing hundreds of widgets on every rerun.
+- Normal filters and the screen selector are visible before the first filter submission.
+
+---
+
 
 ## 2026-07-03
 

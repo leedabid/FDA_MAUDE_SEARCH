@@ -164,41 +164,50 @@ def get_metadata() -> Dict[str, Any]:
     if FILTER_METADATA_CACHE_PATH.exists():
         try:
             with open(FILTER_METADATA_CACHE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if (
+                    isinstance(data, dict)
+                    and data.get("total_reports")
+                    and data.get("canonical_brands_by_category")
+                    and data.get("all_brands_by_category")
+                ):
+                    return data
         except Exception:
             pass
 
     with get_sqlite_conn() as conn:
-        total_reports = conn.execute("SELECT count(*) FROM maude_reports").fetchone()[0]
+        tot_row = conn.execute("SELECT sum(report_count) FROM maude_monthly_summary").fetchone()
+        total_reports = tot_row[0] or 0
+
         date_bounds = conn.execute(
-            "SELECT min(date_received), max(date_received) FROM maude_reports"
+            "SELECT min(month), max(month) FROM maude_monthly_summary"
         ).fetchone()
 
         all_brands = [
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT brand_name FROM maude_reports WHERE brand_name IS NOT NULL AND brand_name != '' ORDER BY brand_name"
+                "SELECT DISTINCT brand_name FROM maude_monthly_summary WHERE brand_name IS NOT NULL AND brand_name != '' ORDER BY brand_name"
             ).fetchall()
         ]
 
         cgm_brands = [
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT brand_name FROM maude_reports WHERE device_category = 'CGM' AND brand_name IS NOT NULL AND brand_name != '' ORDER BY brand_name"
+                "SELECT DISTINCT brand_name FROM maude_monthly_summary WHERE device_category = 'CGM' AND brand_name IS NOT NULL AND brand_name != '' ORDER BY brand_name"
             ).fetchall()
         ]
 
         pump_brands = [
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT brand_name FROM maude_reports WHERE device_category = 'Insulin Pump' AND brand_name IS NOT NULL AND brand_name != '' ORDER BY brand_name"
+                "SELECT DISTINCT brand_name FROM maude_monthly_summary WHERE device_category = 'Insulin Pump' AND brand_name IS NOT NULL AND brand_name != '' ORDER BY brand_name"
             ).fetchall()
         ]
 
         event_types = [
             r[0]
             for r in conn.execute(
-                "SELECT DISTINCT event_type FROM maude_reports WHERE event_type IS NOT NULL ORDER BY event_type"
+                "SELECT DISTINCT event_type FROM maude_monthly_summary WHERE event_type IS NOT NULL ORDER BY event_type"
             ).fetchall()
         ]
 
@@ -213,8 +222,8 @@ def get_metadata() -> Dict[str, Any]:
     meta = {
         "db_path": str(DB_PATH),
         "total_reports": total_reports,
-        "min_date": date_bounds[0] or "2020-01-01",
-        "max_date": date_bounds[1] or "2026-08-31",
+        "min_date": (date_bounds[0] + "-01") if date_bounds and date_bounds[0] else "2020-01-01",
+        "max_date": (date_bounds[1] + "-28") if date_bounds and date_bounds[1] else "2026-08-31",
         "categories": ["CGM", "Insulin Pump"],
         "canonical_brands": canonical_brands,
         "canonical_brands_by_category": {

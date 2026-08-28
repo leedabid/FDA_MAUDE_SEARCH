@@ -31,6 +31,7 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
   const [timeGrain, setTimeGrain] = useState<TimeGrain>("quarter");
   const [brandMode, setBrandMode] = useState<BrandMode>("canonical");
   const [topLimit, setTopLimit] = useState<number>(10);
+  const [chartHeight, setChartHeight] = useState<number>(580);
   const [disabledSeries, setDisabledSeries] = useState<Record<string, boolean>>({});
 
   // Aggregation helper based on TimeGrain (Month -> YYYY-MM, Quarter -> YYYY-Q#, Year -> YYYY)
@@ -243,8 +244,8 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
       grid: {
         left: "2%",
         right: "2%",
-        bottom: "10%",
-        top: "6%",
+        bottom: 45,
+        top: 25,
         containLabel: true,
       },
       xAxis: {
@@ -501,8 +502,8 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
       </div>
 
       {/* 3. Main Chart Canvas Card */}
-      <div className="bg-slate-900/60 border border-slate-800 p-6 rounded-2xl backdrop-blur-md shadow-xl flex flex-col min-h-[580px]">
-        <div className="flex items-center justify-between pb-3 border-b border-slate-800 mb-2">
+      <div className="bg-slate-900/60 border border-slate-800 p-6 rounded-2xl backdrop-blur-md shadow-xl flex flex-col">
+        <div className="flex flex-wrap items-center justify-between pb-3 border-b border-slate-800 mb-3 gap-3">
           <div>
             <h3 className="text-sm font-bold text-white flex items-center gap-2">
               <span>시계열 부작용 보고 추이 분석</span>
@@ -516,9 +517,32 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
               제품 선택을 해제하면 해당 제품을 제외하고 실시간으로 100% 합계를 재계산하여 표시합니다.
             </p>
           </div>
+
+          {/* Chart Height Preset Controls */}
+          <div className="flex items-center gap-1.5 bg-slate-950/80 px-2.5 py-1 rounded-xl border border-slate-800 text-xs">
+            <span className="text-[11px] text-slate-400 mr-1">그래프 높이:</span>
+            {[
+              { label: "기본 (480px)", val: 480 },
+              { label: "확대 (580px)", val: 580 },
+              { label: "최대 (700px)", val: 700 },
+            ].map((h) => (
+              <button
+                key={h.val}
+                type="button"
+                onClick={() => setChartHeight(h.val)}
+                className={`px-2 py-0.5 rounded-lg text-xs transition ${
+                  chartHeight === h.val
+                    ? "bg-indigo-600 text-white font-semibold shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {h.label}
+              </button>
+            ))}
+          </div>
         </div>
 
-        <div className="flex-1 w-full min-h-[500px]">
+        <div className="w-full transition-[height] duration-150" style={{ height: `${chartHeight}px` }}>
           {loading ? (
             <div className="flex items-center justify-center h-full text-slate-400">
               추이 데이터를 계산 중입니다...
@@ -530,7 +554,7 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
           ) : (
             <ReactECharts
               option={chartOption}
-              style={{ height: "100%", width: "100%" }}
+              style={{ height: `${chartHeight}px`, width: "100%" }}
               notMerge={true}
             />
           )}

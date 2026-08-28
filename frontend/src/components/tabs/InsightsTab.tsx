@@ -51,32 +51,39 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
   // -------------------------------------------------------------------------
   const severityTargetData =
     severityMode === "canonical"
-      ? insights.canonical_severity || {}
-      : insights.raw_severity || {};
+      ? insights?.canonical_severity || {}
+      : insights?.raw_severity || {};
 
   // Sort brands by total volume and take top 12
   const sortedBrands = useMemo(() => {
+    if (!severityTargetData || typeof severityTargetData !== "object") return [];
     return Object.entries(severityTargetData)
       .map(([b, counts]) => {
-        const total = (counts.Death || 0) + (counts.Injury || 0) + (counts.Malfunction || 0) + (counts.Other || 0);
-        return { brand: b, total, counts };
+        const c = typeof counts === "object" && counts !== null ? counts : {};
+        const total =
+          Number(c.Death || 0) +
+          Number(c.Injury || 0) +
+          Number(c.Malfunction || 0) +
+          Number(c.Other || 0);
+        return { brand: b, total, counts: c };
       })
       .sort((a, b) => b.total - a.total)
       .slice(0, 12);
   }, [severityTargetData]);
 
   const brandNames = sortedBrands.map((s) => s.brand);
-  const deathData = sortedBrands.map((s) => s.counts.Death || 0);
-  const injuryData = sortedBrands.map((s) => s.counts.Injury || 0);
-  const malData = sortedBrands.map((s) => s.counts.Malfunction || 0);
-  const otherData = sortedBrands.map((s) => s.counts.Other || 0);
+  const deathData = sortedBrands.map((s) => Number(s.counts?.Death || 0));
+  const injuryData = sortedBrands.map((s) => Number(s.counts?.Injury || 0));
+  const malData = sortedBrands.map((s) => Number(s.counts?.Malfunction || 0));
+  const otherData = sortedBrands.map((s) => Number(s.counts?.Other || 0));
 
   const isShareSeverity = severityChartType === "share";
 
   const severityOption = useMemo(() => {
+    if (brandNames.length === 0) return {};
     const calcShare = (val: number, idx: number) => {
       const tot = sortedBrands[idx]?.total || 1;
-      return parseFloat(((val / tot) * 100).toFixed(1));
+      return parseFloat(((val / (tot || 1)) * 100).toFixed(1));
     };
 
     return {
@@ -172,52 +179,55 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
   // -------------------------------------------------------------------------
   // 2. Reporting Pathways: Donut Share & Time-Series Trend
   // -------------------------------------------------------------------------
-  const pathwaysDist = insights.pathways_distribution || {};
+  const pathwaysDist = insights?.pathways_distribution || {};
   const donutData = Object.entries(pathwaysDist).map(([name, value]) => ({
-    name,
-    value,
+    name: name || "기타/미상",
+    value: Number(value || 0),
   }));
 
-  const pathwayDonutOption = {
-    backgroundColor: "transparent",
-    tooltip: {
-      trigger: "item",
-      backgroundColor: "#0f172a",
-      borderColor: "#334155",
-      textStyle: { color: "#f8fafc" },
-      formatter: "{b}: {c}건 ({d}%)",
-    },
-    legend: {
-      orient: "vertical",
-      right: "5%",
-      top: "center",
-      textStyle: { color: "#94a3b8", fontSize: 11 },
-    },
-    color: ["#6366f1", "#10b981", "#f59e0b", "#ec4899", "#64748b"],
-    series: [
-      {
-        type: "pie",
-        radius: ["48%", "72%"],
-        center: ["40%", "50%"],
-        avoidLabelOverlap: false,
-        itemStyle: {
-          borderRadius: 8,
-          borderColor: "#0f172a",
-          borderWidth: 2,
-        },
-        label: { show: false },
-        emphasis: {
-          label: {
-            show: true,
-            fontSize: 13,
-            fontWeight: "bold",
-            color: "#fff",
-          },
-        },
-        data: donutData,
+  const pathwayDonutOption = useMemo(() => {
+    if (donutData.length === 0) return {};
+    return {
+      backgroundColor: "transparent",
+      tooltip: {
+        trigger: "item",
+        backgroundColor: "#0f172a",
+        borderColor: "#334155",
+        textStyle: { color: "#f8fafc" },
+        formatter: "{b}: {c}건 ({d}%)",
       },
-    ],
-  };
+      legend: {
+        orient: "vertical",
+        right: "5%",
+        top: "center",
+        textStyle: { color: "#94a3b8", fontSize: 11 },
+      },
+      color: ["#6366f1", "#10b981", "#f59e0b", "#ec4899", "#64748b"],
+      series: [
+        {
+          type: "pie",
+          radius: ["48%", "72%"],
+          center: ["40%", "50%"],
+          avoidLabelOverlap: false,
+          itemStyle: {
+            borderRadius: 8,
+            borderColor: "#0f172a",
+            borderWidth: 2,
+          },
+          label: { show: false },
+          emphasis: {
+            label: {
+              show: true,
+              fontSize: 13,
+              fontWeight: "bold",
+              color: "#fff",
+            },
+          },
+          data: donutData,
+        },
+      ],
+    };
+  }, [donutData]);
 
   // Time-Series Pathway aggregation
   const formatPathwayTime = (m: string, grain: PathwayTimeGrain): string => {
@@ -232,7 +242,7 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
   };
 
   const { pathwayTimeKeys, pathwaySeries } = useMemo(() => {
-    const rawTimeline = insights.pathways_timeline || [];
+    const rawTimeline = insights?.pathways_timeline || [];
     const timeSet = new Set<string>();
     const pathways = [
       "MDR (제조사 의무보고)",
@@ -318,46 +328,49 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
     });
 
     return { pathwayTimeKeys: sortedTime, pathwaySeries: series };
-  }, [insights.pathways_timeline, pathwayTimeGrain, pathwayChartType]);
+  }, [insights?.pathways_timeline, pathwayTimeGrain, pathwayChartType]);
 
-  const pathwayTimelineOption = {
-    backgroundColor: "transparent",
-    tooltip: {
-      trigger: "axis",
-      backgroundColor: "#0f172a",
-      borderColor: "#334155",
-      textStyle: { color: "#f8fafc", fontSize: 12 },
-    },
-    legend: {
-      top: 0,
-      textStyle: { color: "#94a3b8", fontSize: 11 },
-    },
-    grid: {
-      left: "3%",
-      right: "3%",
-      bottom: "8%",
-      top: "14%",
-      containLabel: true,
-    },
-    xAxis: {
-      type: "category",
-      boundaryGap: pathwayChartType === "bar" || pathwayChartType === "share",
-      data: pathwayTimeKeys,
-      axisLine: { lineStyle: { color: "#334155" } },
-      axisLabel: { color: "#94a3b8", fontSize: 11 },
-    },
-    yAxis: {
-      type: "value",
-      max: pathwayChartType === "share" ? 100 : undefined,
-      min: pathwayChartType === "share" ? 0 : undefined,
-      axisLabel: {
-        color: "#94a3b8",
-        formatter: (v: number) => (pathwayChartType === "share" ? `${v}%` : v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v),
+  const pathwayTimelineOption = useMemo(() => {
+    if (pathwayTimeKeys.length === 0) return {};
+    return {
+      backgroundColor: "transparent",
+      tooltip: {
+        trigger: "axis",
+        backgroundColor: "#0f172a",
+        borderColor: "#334155",
+        textStyle: { color: "#f8fafc", fontSize: 12 },
       },
-      splitLine: { lineStyle: { color: "#1e293b", type: "dashed" } },
-    },
-    series: pathwaySeries,
-  };
+      legend: {
+        top: 0,
+        textStyle: { color: "#94a3b8", fontSize: 11 },
+      },
+      grid: {
+        left: "3%",
+        right: "3%",
+        bottom: "8%",
+        top: "14%",
+        containLabel: true,
+      },
+      xAxis: {
+        type: "category",
+        boundaryGap: pathwayChartType === "bar" || pathwayChartType === "share",
+        data: pathwayTimeKeys,
+        axisLine: { lineStyle: { color: "#334155" } },
+        axisLabel: { color: "#94a3b8", fontSize: 11 },
+      },
+      yAxis: {
+        type: "value",
+        max: pathwayChartType === "share" ? 100 : undefined,
+        min: pathwayChartType === "share" ? 0 : undefined,
+        axisLabel: {
+          color: "#94a3b8",
+          formatter: (v: number) => (pathwayChartType === "share" ? `${v}%` : v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v),
+        },
+        splitLine: { lineStyle: { color: "#1e293b", type: "dashed" } },
+      },
+      series: pathwaySeries,
+    };
+  }, [pathwayTimeKeys, pathwaySeries, pathwayChartType]);
 
   return (
     <div className="space-y-6 animate-fadeIn">

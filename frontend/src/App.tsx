@@ -9,6 +9,7 @@ import { InsightsTab } from "./components/tabs/InsightsTab";
 import { BookmarksTab } from "./components/tabs/BookmarksTab";
 import { BrandGroupManagerModal } from "./components/modals/BrandGroupManagerModal";
 import { SyncModal } from "./components/modals/SyncModal";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 import {
   getMetadata,
@@ -175,60 +176,62 @@ export const App: React.FC = () => {
 
         {/* Dynamic Tab Body */}
         <main className="flex-1 overflow-y-auto p-6 custom-scrollbar bg-gradient-to-br from-slate-950 via-slate-900/40 to-slate-950">
-          {activeTab === "overview" && (
-            <OverviewTab
-              stats={overviewStats}
-              loading={loadingOverview}
-              filters={appliedFilters}
-              metadata={metadata}
-              onOpenSyncModal={() => setIsSyncModalOpen(true)}
-            />
-          )}
+          <ErrorBoundary tabName={activeTab}>
+            {activeTab === "overview" && (
+              <OverviewTab
+                stats={overviewStats}
+                loading={loadingOverview}
+                filters={appliedFilters}
+                metadata={metadata}
+                onOpenSyncModal={() => setIsSyncModalOpen(true)}
+              />
+            )}
 
-          {activeTab === "reports" && (
-            <ReportsTab
-              filters={appliedFilters}
-              selectedReportNumber={selectedReportNumber}
-              onClearSelectedReport={() => setSelectedReportNumber(null)}
-            />
-          )}
+            {activeTab === "reports" && (
+              <ReportsTab
+                filters={appliedFilters}
+                selectedReportNumber={selectedReportNumber}
+                onClearSelectedReport={() => setSelectedReportNumber(null)}
+              />
+            )}
 
-          {activeTab === "monthly" && (
-            <MonthlyTrendTab
-              data={monthlyStats}
-              loading={loadingMonthly}
-              metadata={metadata}
-            />
-          )}
+            {activeTab === "monthly" && (
+              <MonthlyTrendTab
+                data={monthlyStats}
+                loading={loadingMonthly}
+                metadata={metadata}
+              />
+            )}
 
-          {activeTab === "problems" && (
-            <ProblemCodesTab
-              patientProblems={patientProblems}
-              productProblems={productProblems}
-              loading={loadingProblems}
-              onSelectCode={(code) => {
-                setStagedFilters((prev) => ({ ...prev, code_filter: code }));
-                setAppliedFilters((prev) => ({ ...prev, code_filter: code }));
-                setActiveTab("reports");
-              }}
-            />
-          )}
+            {activeTab === "problems" && (
+              <ProblemCodesTab
+                patientProblems={patientProblems || []}
+                productProblems={productProblems || []}
+                loading={loadingProblems}
+                onSelectCode={(code) => {
+                  setStagedFilters((prev) => ({ ...prev, code_filter: code }));
+                  setAppliedFilters((prev) => ({ ...prev, code_filter: code }));
+                  setActiveTab("reports");
+                }}
+              />
+            )}
 
-          {activeTab === "insights" && (
-            <InsightsTab
-              insights={insightsData}
-              loading={loadingInsights}
-            />
-          )}
+            {activeTab === "insights" && (
+              <InsightsTab
+                insights={insightsData}
+                loading={loadingInsights}
+              />
+            )}
 
-          {activeTab === "bookmarks" && (
-            <BookmarksTab
-              onOpenReportDetail={(rnum) => {
-                setSelectedReportNumber(rnum);
-                setActiveTab("reports");
-              }}
-            />
-          )}
+            {activeTab === "bookmarks" && (
+              <BookmarksTab
+                onOpenReportDetail={(rnum) => {
+                  setSelectedReportNumber(rnum);
+                  setActiveTab("reports");
+                }}
+              />
+            )}
+          </ErrorBoundary>
         </main>
       </div>
 

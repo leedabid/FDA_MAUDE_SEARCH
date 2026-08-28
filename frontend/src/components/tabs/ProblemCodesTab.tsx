@@ -29,11 +29,13 @@ export const ProblemCodesTab: React.FC<ProblemCodesTabProps> = ({
     );
   }
 
-  const currentList = activeSubTab === "patient" ? patientProblems : productProblems;
+  const currentList = Array.isArray(activeSubTab === "patient" ? patientProblems : productProblems)
+    ? (activeSubTab === "patient" ? patientProblems : productProblems)
+    : [];
   const filteredList = currentList.filter(
     (item) =>
-      item.term.toLowerCase().includes(search.toLowerCase()) ||
-      item.code.toLowerCase().includes(search.toLowerCase())
+      String(item?.term || "").toLowerCase().includes(search.toLowerCase()) ||
+      String(item?.code || "").toLowerCase().includes(search.toLowerCase())
   );
 
   return (
@@ -130,7 +132,7 @@ export const ProblemCodesTab: React.FC<ProblemCodesTabProps> = ({
                       {item.term}
                     </td>
                     <td className="px-4 py-3 text-right font-mono font-bold text-slate-200">
-                      {item.count.toLocaleString()}건
+                      {Number(item?.count || 0).toLocaleString()}건
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex flex-wrap gap-1 max-w-md">

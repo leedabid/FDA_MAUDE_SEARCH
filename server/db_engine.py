@@ -396,20 +396,30 @@ def get_stats_monthly(
 # Reports Table Query with CTE Late Join for 100% Accurate Narrative Evaluation
 # ---------------------------------------------------------------------------
 def query_reports(
-    filters: Dict[str, Any],
+    filters: Optional[Dict[str, Any]] = None,
+    categories: Optional[List[str]] = None,
+    brands: Optional[List[str]] = None,
+    event_types: Optional[List[str]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    keyword: Optional[str] = None,
+    code_filter: Optional[str] = None,
+    report_numbers: Optional[List[str]] = None,
     page: int = 1,
     page_size: int = 50,
     sort_by: str = "date_received",
     sort_desc: bool = True,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
-    categories = filters.get("categories")
-    brands = filters.get("brands")
-    event_types = filters.get("event_types")
-    date_from = filters.get("date_from")
-    date_to = filters.get("date_to")
-    keyword = filters.get("keyword")
-    code_filter = filters.get("code_filter")
-    report_numbers = filters.get("report_numbers")
+    if isinstance(filters, dict):
+        categories = filters.get("categories", categories)
+        brands = filters.get("brands", brands)
+        event_types = filters.get("event_types", event_types)
+        date_from = filters.get("date_from", date_from)
+        date_to = filters.get("date_to", date_to)
+        keyword = filters.get("keyword", keyword)
+        code_filter = filters.get("code_filter", code_filter)
+        report_numbers = filters.get("report_numbers", report_numbers)
 
     offset = max(0, (page - 1) * page_size)
     allowed_sorts = {

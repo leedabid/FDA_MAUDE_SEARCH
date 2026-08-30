@@ -305,8 +305,17 @@ if FRONTEND_DIST.exists():
 @app.on_event("startup")
 def on_startup():
     def _open():
+        import socket
         import time
-        time.sleep(1.2)
+
+        # Wait until port 8000 is actively accepting connections
+        for _ in range(50):
+            try:
+                with socket.create_connection(("127.0.0.1", 8000), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+
         webbrowser.open("http://localhost:8000")
 
     if not os.environ.get("NO_BROWSER"):

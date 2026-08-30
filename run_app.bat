@@ -19,10 +19,8 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 echo [*] Starting Server at http://localhost:8000 ...
-echo [*] Web browser will open automatically.
+echo [*] Web browser will open automatically once the server is ready.
 echo.
-
-start "" "http://localhost:8000"
 
 ".venv\Scripts\python.exe" -m uvicorn server.main:app --host 127.0.0.1 --port 8000
 

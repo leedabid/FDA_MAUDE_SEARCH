@@ -87,45 +87,46 @@ export const Sidebar: React.FC<SidebarProps> = ({
     }));
   };
 
-  // 1. Candidate brands strictly constrained by active device categories (CGM vs Insulin Pump)
-  const candidateBrands = useMemo(() => {
+  // 1. Separate Canonical and All Candidate lists strictly constrained by active device categories
+  const canonicalCandidates = useMemo(() => {
     if (!metadata) return [];
     const activeCats = stagedFilters.categories;
-    const isCanonical = brandViewMode === "canonical";
-
-    if (isCanonical) {
-      if (
-        !activeCats ||
-        activeCats.length === 0 ||
-        activeCats.length === 2 ||
-        !metadata.canonical_brands_by_category
-      ) {
-        return metadata.canonical_brands || [];
-      }
-      const list: string[] = [];
-      activeCats.forEach((cat) => {
-        const catList = metadata.canonical_brands_by_category?.[cat] || [];
-        list.push(...catList);
-      });
-      return list;
-    } else {
-      // All raw brands mode
-      if (
-        !activeCats ||
-        activeCats.length === 0 ||
-        activeCats.length === 2 ||
-        !metadata.all_brands_by_category
-      ) {
-        return metadata.all_brands || [];
-      }
-      const list: string[] = [];
-      activeCats.forEach((cat) => {
-        const catList = metadata.all_brands_by_category?.[cat] || [];
-        list.push(...catList);
-      });
-      return list;
+    if (
+      !activeCats ||
+      activeCats.length === 0 ||
+      activeCats.length === 2 ||
+      !metadata.canonical_brands_by_category
+    ) {
+      return metadata.canonical_brands || [];
     }
-  }, [metadata, stagedFilters.categories, brandViewMode]);
+    const list: string[] = [];
+    activeCats.forEach((cat) => {
+      const catList = metadata.canonical_brands_by_category?.[cat] || [];
+      list.push(...catList);
+    });
+    return list;
+  }, [metadata, stagedFilters.categories]);
+
+  const allCandidates = useMemo(() => {
+    if (!metadata) return [];
+    const activeCats = stagedFilters.categories;
+    if (
+      !activeCats ||
+      activeCats.length === 0 ||
+      activeCats.length === 2 ||
+      !metadata.all_brands_by_category
+    ) {
+      return metadata.all_brands || [];
+    }
+    const list: string[] = [];
+    activeCats.forEach((cat) => {
+      const catList = metadata.all_brands_by_category?.[cat] || [];
+      list.push(...catList);
+    });
+    return list;
+  }, [metadata, stagedFilters.categories]);
+
+  const candidateBrands = brandViewMode === "canonical" ? canonicalCandidates : allCandidates;
 
   // 2. Filter candidate brands by search query (multi-word match)
   const displayedBrands = useMemo(() => {
@@ -166,7 +167,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   return (
-    <aside className="w-80 bg-slate-900/60 border-r border-slate-800 p-4 flex flex-col gap-4 overflow-y-auto custom-scrollbar shrink-0 select-none">
+    <aside className="w-96 bg-slate-900/70 border-r border-slate-800 p-4 flex flex-col gap-4 overflow-y-auto custom-scrollbar shrink-0 select-none h-full">
       {/* Filter Header, Apply Button & Reset */}
       <div className="space-y-2 pb-3 border-b border-slate-800">
         <div className="flex items-center justify-between">
@@ -291,7 +292,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* 4. Brand Filter with Active Tags, Mode Toggle & Manager */}
-      <div className="space-y-2 flex-1 flex flex-col min-h-[260px]">
+      <div className="space-y-2 flex flex-col">
         <div className="flex items-center justify-between">
           <label className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
             <Layers className="w-3.5 h-3.5 text-indigo-400" />
@@ -307,7 +308,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </button>
         </div>
 
-        {/* Selected Brands Indicator & Chips */}
+        {/* Selected Brands Indicator & Chips (Displays 5~6 rows cleanly with smooth scrolling) */}
         {stagedFilters.brands.length > 0 && (
           <div className="p-2.5 bg-indigo-950/40 border border-indigo-500/30 rounded-xl space-y-1.5">
             <div className="flex items-center justify-between text-[11px]">
@@ -325,13 +326,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 선택 비우기
               </button>
             </div>
-            <div className="flex flex-wrap gap-1 max-h-16 overflow-y-auto custom-scrollbar">
+            <div className="flex flex-wrap gap-1 max-h-36 overflow-y-auto custom-scrollbar p-0.5">
               {stagedFilters.brands.map((b) => (
                 <span
                   key={b}
                   className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-600/30 border border-indigo-500/40 text-[10px] text-indigo-200 font-mono"
                 >
-                  <span className="truncate max-w-[120px]" title={b}>
+                  <span className="truncate max-w-[140px]" title={b}>
                     {b}
                   </span>
                   <button
@@ -348,7 +349,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         )}
 
-        {/* View Mode Toggle */}
+        {/* View Mode Toggle: Accurate separate counts */}
         <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 text-[11px]">
           <button
             type="button"
@@ -359,7 +360,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            🏷️ 대표 그룹 ({candidateBrands.length})
+            🏷️ 대표 그룹 ({canonicalCandidates.length})
           </button>
           <button
             type="button"
@@ -370,7 +371,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 : "text-slate-400 hover:text-slate-200"
             }`}
           >
-            📋 전체 원본 ({candidateBrands.length})
+            📋 전체 원본 ({allCandidates.length})
           </button>
         </div>
 
@@ -418,10 +419,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         </div>
 
-        {/* Brands Scrollable List */}
-        <div className="flex-1 overflow-y-auto max-h-48 border border-slate-800 rounded-xl p-2 bg-slate-950/40 space-y-1 custom-scrollbar">
+        {/* Brands Scrollable List: Tall window (~20 items at once) with smooth scrolling */}
+        <div className="h-[480px] overflow-y-auto border border-slate-800 rounded-xl p-2 bg-slate-950/40 space-y-1 custom-scrollbar">
           {displayedBrands.length === 0 ? (
-            <div className="text-center py-4 text-slate-500 text-[11px]">
+            <div className="text-center py-8 text-slate-500 text-[11px]">
               선택된 카테고리에 해당하는 제품이 없습니다.
             </div>
           ) : (

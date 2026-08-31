@@ -669,15 +669,17 @@ def get_problem_codes_stats(
     }
 
 
-def _map_source_type_to_pathway(raw_src: Optional[str]) -> str:
-    s = (raw_src or "").strip().upper()
-    if "FOREIGN" in s:
+def _map_source_type_to_pathway(report_source_code: Optional[str], source_type: Optional[str]) -> str:
+    rsc = (report_source_code or "").strip().upper()
+    st = (source_type or "").strip().upper()
+
+    if "FOREIGN" in st or "FOREIGN" in rsc:
         return "Foreign (해외 보고)"
-    if "DISTRIBUTOR" in s:
+    if "DISTRIBUTOR" in st or "DISTRIBUTOR" in rsc:
         return "Distributor (유통/수입사)"
-    if "CONSUMER" in s or "HEALTH PROFESSIONAL" in s or "VOLUNTARY" in s or "PATIENT" in s or "USER" in s:
+    if "VOLUNTARY" in rsc or "CONSUMER" in st or "PATIENT" in st or "HEALTH PROFESSIONAL" in st or "USER" in st:
         return "MedWatch (자발적 보고)"
-    if "COMPANY" in s or "MANUFACTURER" in s or "MDR" in s:
+    if "MANUFACTURER" in rsc or "COMPANY" in st or "MDR" in rsc:
         return "MDR (제조사 의무보고)"
     return "Other/Literature (문헌/기타)"
 
@@ -757,15 +759,16 @@ def get_insights(
         src_rows = conn.execute(
             f"""
             SELECT substr(date_received, 1, 7) as ym,
-                   coalesce(source_type, report_source_code, 'Other') as src,
+                   report_source_code,
+                   source_type,
                    count(*) as cnt
             FROM (
-                SELECT date_received, source_type, report_source_code
+                SELECT date_received, report_source_code, source_type
                 FROM maude_reports r
                 WHERE {r_where}
                 LIMIT 5000
             ) sub
-            GROUP BY ym, src
+            GROUP BY ym, report_source_code, source_type
             ORDER BY ym ASC
             """,
             r_params,
@@ -781,10 +784,10 @@ def get_insights(
     }
 
     for r in src_rows:
-        ym, raw_src, cnt = r[0], r[1], r[2]
+        ym, rsc, st, cnt = r[0], r[1], r[2], r[3]
         if not ym or len(ym) < 7:
             continue
-        pathway = _map_source_type_to_pathway(raw_src)
+        pathway = _map_source_type_to_pathway(rsc, st)
         pathways_dist[pathway] = pathways_dist.get(pathway, 0) + cnt
 
         if ym not in timeline_map:
@@ -827,6 +830,9 @@ def get_bookmarks() -> Dict[str, Any]:
     return {"bookmarks": {}, "folders": ["기본 보관함", "임상 분석", "제조 결함", "저혈당 쇼크"]}
 
 
+load_bookmarks = get_bookmarks
+
+
 def save_bookmark(
     report_number: str,
     folder: str = "기본 보관함",
@@ -855,6 +861,9 @@ def save_bookmark(
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     return data
+
+
+set_bookmark = save_bookmark
 
 
 def delete_bookmark(report_number: str) -> Dict[str, Any]:

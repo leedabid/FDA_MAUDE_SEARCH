@@ -105,7 +105,7 @@ export const App: React.FC = () => {
       } finally {
         setLoadingMonthly(false);
       }
-    } else if (activeTab === "problems") {
+    } else if (activeTab === "codes" || activeTab === "problems") {
       setLoadingProblems(true);
       try {
         const data = await getProblemCodes(appliedFilters, 30);
@@ -203,7 +203,7 @@ export const App: React.FC = () => {
               />
             )}
 
-            {activeTab === "problems" && (
+            {(activeTab === "codes" || activeTab === "problems") && (
               <ProblemCodesTab
                 patientProblems={patientProblems || []}
                 productProblems={productProblems || []}

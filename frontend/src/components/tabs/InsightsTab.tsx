@@ -35,17 +35,6 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
   const [pathwayTimeGrain, setPathwayTimeGrain] = useState<PathwayTimeGrain>("month");
   const [pathwayChartType, setPathwayChartType] = useState<PathwayChartType>("share");
 
-  if (loading || !insights) {
-    return (
-      <div className="flex items-center justify-center h-96">
-        <div className="flex flex-col items-center space-y-3">
-          <div className="w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
-          <p className="text-xs text-slate-400">안전성 및 보고 경로 인사이트를 분석 중입니다...</p>
-        </div>
-      </div>
-    );
-  }
-
   // -------------------------------------------------------------------------
   // 1. Severity Matrix Chart (Canonical Groups vs Raw Brands)
   // -------------------------------------------------------------------------
@@ -56,7 +45,7 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
 
   // Sort brands by total volume and take top 12
   const sortedBrands = useMemo(() => {
-    if (!severityTargetData || typeof severityTargetData !== "object") return [];
+    if (!insights || !severityTargetData || typeof severityTargetData !== "object") return [];
     return Object.entries(severityTargetData)
       .map(([b, counts]) => {
         const c = typeof counts === "object" && counts !== null ? counts : {};
@@ -69,7 +58,7 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
       })
       .sort((a, b) => b.total - a.total)
       .slice(0, 12);
-  }, [severityTargetData]);
+  }, [insights, severityTargetData]);
 
   const brandNames = sortedBrands.map((s) => s.brand);
   const deathData = sortedBrands.map((s) => Number(s.counts?.Death || 0));
@@ -130,13 +119,14 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
         axisLabel: {
           color: "#94a3b8",
           fontSize: 11,
+          rotate: brandNames.length > 6 ? 25 : 0,
           interval: 0,
-          rotate: brandNames.length > 6 ? 20 : 0,
         },
       },
       yAxis: {
         type: "value",
         max: isShareSeverity ? 100 : undefined,
+        min: isShareSeverity ? 0 : undefined,
         axisLabel: {
           color: "#94a3b8",
           formatter: (v: number) => (isShareSeverity ? `${v}%` : v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v),
@@ -146,35 +136,35 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
       series: [
         {
           name: "사망 (Death)",
-          type: "bar",
-          stack: isShareSeverity || severityChartType === "stacked_bar" ? "total" : undefined,
+          type: severityChartType === "grouped_bar" ? "bar" : "bar",
+          stack: severityChartType === "grouped_bar" ? undefined : "total",
           data: isShareSeverity ? deathData.map(calcShare) : deathData,
-          itemStyle: { color: "#f43f5e" },
+          itemStyle: { color: "#ef4444" },
         },
         {
           name: "상해 (Injury)",
-          type: "bar",
-          stack: isShareSeverity || severityChartType === "stacked_bar" ? "total" : undefined,
+          type: severityChartType === "grouped_bar" ? "bar" : "bar",
+          stack: severityChartType === "grouped_bar" ? undefined : "total",
           data: isShareSeverity ? injuryData.map(calcShare) : injuryData,
-          itemStyle: { color: "#f59e0b" },
+          itemStyle: { color: "#f97316" },
         },
         {
           name: "오작동 (Malfunction)",
-          type: "bar",
-          stack: isShareSeverity || severityChartType === "stacked_bar" ? "total" : undefined,
+          type: severityChartType === "grouped_bar" ? "bar" : "bar",
+          stack: severityChartType === "grouped_bar" ? undefined : "total",
           data: isShareSeverity ? malData.map(calcShare) : malData,
           itemStyle: { color: "#3b82f6" },
         },
         {
           name: "기타 (Other)",
-          type: "bar",
-          stack: isShareSeverity || severityChartType === "stacked_bar" ? "total" : undefined,
+          type: severityChartType === "grouped_bar" ? "bar" : "bar",
+          stack: severityChartType === "grouped_bar" ? undefined : "total",
           data: isShareSeverity ? otherData.map(calcShare) : otherData,
           itemStyle: { color: "#64748b" },
         },
       ],
     };
-  }, [brandNames, deathData, injuryData, malData, otherData, severityChartType, isShareSeverity, sortedBrands]);
+  }, [brandNames, deathData, injuryData, malData, otherData, isShareSeverity, severityChartType, sortedBrands]);
 
   // -------------------------------------------------------------------------
   // 2. Reporting Pathways: Donut Share & Time-Series Trend
@@ -371,6 +361,18 @@ export const InsightsTab: React.FC<InsightsTabProps> = ({ insights, loading }) =
       series: pathwaySeries,
     };
   }, [pathwayTimeKeys, pathwaySeries, pathwayChartType]);
+
+  // If loading or insights is empty, display loading spinner AFTER all hooks are called!
+  if (loading || !insights) {
+    return (
+      <div className="flex items-center justify-center h-96">
+        <div className="flex flex-col items-center space-y-3">
+          <div className="w-8 h-8 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+          <p className="text-xs text-slate-400">안전성 및 보고 경로 인사이트를 분석 중입니다...</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6 animate-fadeIn">

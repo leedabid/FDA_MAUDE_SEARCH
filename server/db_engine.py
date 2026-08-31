@@ -143,17 +143,26 @@ def _build_filter_clauses(
 
     # 4. Date range
     if date_from:
-        clauses.append(f"{prefix}date_received >= ?")
-        params.append(date_from)
+        if prefix.startswith("s"):
+            clauses.append(f"{prefix}month >= ?")
+            params.append(date_from[:7])
+        else:
+            clauses.append(f"{prefix}date_received >= ?")
+            params.append(date_from)
     if date_to:
-        clauses.append(f"{prefix}date_received <= ?")
-        params.append(date_to)
+        if prefix.startswith("s"):
+            clauses.append(f"{prefix}month <= ?")
+            params.append(date_to[:7])
+        else:
+            clauses.append(f"{prefix}date_received <= ?")
+            params.append(date_to)
 
     # 5. IMDRF Code filter
     if code_filter:
-        code_term = get_term_by_code(code_filter) or code_filter
-        clauses.append(f"({prefix}patient_problems LIKE ? OR {prefix}product_problems LIKE ?)")
-        params.extend([f"%{code_term}%", f"%{code_term}%"])
+        if not prefix.startswith("s"):
+            code_term = get_term_by_code(code_filter) or code_filter
+            clauses.append(f"({prefix}patient_problems LIKE ? OR {prefix}product_problems LIKE ?)")
+            params.extend([f"%{code_term}%", f"%{code_term}%"])
 
     return clauses, params
 
@@ -591,6 +600,11 @@ def get_problem_codes_stats(
         code_filter=code_filter,
         prefix="r.",
     )
+    if keyword and keyword.strip():
+        kw = f"%{keyword.strip()}%"
+        clauses.append("(r.brand_name LIKE ? OR r.generic_name LIKE ? OR r.manufacturer_name LIKE ? OR r.patient_problems LIKE ? OR r.product_problems LIKE ? OR r.report_number LIKE ?)")
+        params.extend([kw, kw, kw, kw, kw, kw])
+
     where_sql = " AND ".join(clauses) if clauses else "1=1"
 
     with get_sqlite_conn() as conn:

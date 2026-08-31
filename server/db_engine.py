@@ -669,6 +669,19 @@ def get_problem_codes_stats(
     }
 
 
+def _map_source_type_to_pathway(raw_src: Optional[str]) -> str:
+    s = (raw_src or "").strip().upper()
+    if "FOREIGN" in s:
+        return "Foreign (해외 보고)"
+    if "DISTRIBUTOR" in s:
+        return "Distributor (유통/수입사)"
+    if "CONSUMER" in s or "HEALTH PROFESSIONAL" in s or "VOLUNTARY" in s or "PATIENT" in s or "USER" in s:
+        return "MedWatch (자발적 보고)"
+    if "COMPANY" in s or "MANUFACTURER" in s or "MDR" in s:
+        return "MDR (제조사 의무보고)"
+    return "Other/Literature (문헌/기타)"
+
+
 # ---------------------------------------------------------------------------
 # Insights & Advanced Analytics
 # ---------------------------------------------------------------------------
@@ -723,7 +736,7 @@ def get_insights(
 
         monthly_trend_map[ym] = monthly_trend_map.get(ym, 0) + cnt
 
-    # Pathways distribution from indexed sample
+    # Pathways distribution and time-series from indexed sample
     r_clauses, r_params = _build_filter_clauses(
         categories=categories,
         brands=brands,
@@ -733,23 +746,59 @@ def get_insights(
         code_filter=code_filter,
         prefix="r.",
     )
+    if keyword and keyword.strip():
+        kw = f"%{keyword.strip()}%"
+        r_clauses.append("(r.brand_name LIKE ? OR r.generic_name LIKE ? OR r.manufacturer_name LIKE ? OR r.patient_problems LIKE ? OR r.product_problems LIKE ? OR r.report_number LIKE ?)")
+        r_params.extend([kw, kw, kw, kw, kw, kw])
+
     r_where = " AND ".join(r_clauses) if r_clauses else "1=1"
     
     with get_sqlite_conn() as conn:
         src_rows = conn.execute(
             f"""
-            SELECT report_source_code, count(*)
+            SELECT substr(date_received, 1, 7) as ym,
+                   coalesce(source_type, report_source_code, 'Other') as src,
+                   count(*) as cnt
             FROM (
-                SELECT report_source_code
+                SELECT date_received, source_type, report_source_code
                 FROM maude_reports r
                 WHERE {r_where}
-                LIMIT 2000
+                LIMIT 5000
             ) sub
-            GROUP BY report_source_code
+            GROUP BY ym, src
+            ORDER BY ym ASC
             """,
             r_params,
         ).fetchall()
-        pathways_dist = { (r[0] or "Voluntary report"): r[1] for r in src_rows }
+
+    timeline_map: Dict[str, Dict[str, Any]] = {}
+    pathways_dist: Dict[str, int] = {
+        "MDR (제조사 의무보고)": 0,
+        "MedWatch (자발적 보고)": 0,
+        "Foreign (해외 보고)": 0,
+        "Distributor (유통/수입사)": 0,
+        "Other/Literature (문헌/기타)": 0,
+    }
+
+    for r in src_rows:
+        ym, raw_src, cnt = r[0], r[1], r[2]
+        if not ym or len(ym) < 7:
+            continue
+        pathway = _map_source_type_to_pathway(raw_src)
+        pathways_dist[pathway] = pathways_dist.get(pathway, 0) + cnt
+
+        if ym not in timeline_map:
+            timeline_map[ym] = {
+                "month": ym,
+                "MDR (제조사 의무보고)": 0,
+                "MedWatch (자발적 보고)": 0,
+                "Foreign (해외 보고)": 0,
+                "Distributor (유통/수입사)": 0,
+                "Other/Literature (문헌/기타)": 0,
+            }
+        timeline_map[ym][pathway] += cnt
+
+    pathways_timeline = [timeline_map[ym] for ym in sorted(timeline_map.keys())]
 
     recent_trend = [
         {"month": ym, "count": monthly_trend_map[ym]}
@@ -760,7 +809,7 @@ def get_insights(
         "canonical_severity": canonical_severity,
         "raw_severity": raw_severity,
         "pathways_distribution": pathways_dist,
-        "pathways_timeline": [],
+        "pathways_timeline": pathways_timeline,
         "recent_month_trend": recent_trend,
     }
 

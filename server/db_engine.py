@@ -391,18 +391,19 @@ def get_stats_monthly(
             params,
         ).fetchall()
 
-    agg: Dict[Tuple[str, str, str], int] = {}
+    agg: Dict[Tuple[str, str, str, str], int] = {}
     for r in rows:
         ym, raw_b, et, cnt = r[0], r[1], r[2], r[3]
         c_brand = MEMBER_TO_CANONICAL.get(raw_b.upper().strip(), raw_b)
-        key = (ym, c_brand, et)
+        key = (ym, c_brand, raw_b, et)
         agg[key] = agg.get(key, 0) + cnt
 
     result = []
-    for (ym, b_name, et), cnt in agg.items():
+    for (ym, b_name, raw_b, et), cnt in agg.items():
         result.append({
             "month": ym,
             "brand_name": b_name,
+            "raw_brand_name": raw_b,
             "event_type": et,
             "count": cnt,
         })

@@ -31,7 +31,9 @@ export const SyncModal: React.FC<SyncModalProps> = ({
   const [dateTo, setDateTo] = useState<string>(new Date().toISOString().split("T")[0]);
   const [status, setStatus] = useState<SyncStatusResponse | null>(null);
   const [polling, setPolling] = useState<boolean>(false);
+  const [autoScroll, setAutoScroll] = useState<boolean>(true);
   const logContainerRef = useRef<HTMLDivElement>(null);
+  const isUserScrolledUp = useRef<boolean>(false);
 
   // Poll status while modal is open or while running
   useEffect(() => {
@@ -54,12 +56,29 @@ export const SyncModal: React.FC<SyncModalProps> = ({
     return () => clearInterval(interval);
   }, [isOpen]);
 
-  // Auto-scroll logs
+  // Handle scroll events to detect if user scrolled up to read past logs
+  const handleLogScroll = () => {
+    if (logContainerRef.current) {
+      const { scrollTop, scrollHeight, clientHeight } = logContainerRef.current;
+      // If user is near bottom (within 40px), keep autoScroll active
+      const isNearBottom = scrollHeight - scrollTop - clientHeight < 40;
+      isUserScrolledUp.current = !isNearBottom;
+    }
+  };
+
+  // Smart Auto-scroll logs: only scroll down if autoScroll is on and user hasn't scrolled up
   useEffect(() => {
+    if (autoScroll && !isUserScrolledUp.current && logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
+  }, [status?.logs, autoScroll]);
+
+  const scrollToBottom = () => {
+    isUserScrolledUp.current = false;
     if (logContainerRef.current) {
       logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
     }
-  }, [status?.logs]);
+  };
 
   const handleStartSync = async () => {
     try {
@@ -239,10 +258,29 @@ export const SyncModal: React.FC<SyncModalProps> = ({
                     <Terminal className="w-3.5 h-3.5 text-emerald-400" />
                     실시간 수집 로그
                   </span>
+                  <div className="flex items-center gap-2">
+                    <label className="flex items-center gap-1 cursor-pointer text-[10px] text-slate-400 hover:text-white select-none">
+                      <input
+                        type="checkbox"
+                        checked={autoScroll}
+                        onChange={(e) => setAutoScroll(e.target.checked)}
+                        className="rounded border-slate-700 bg-slate-800 text-indigo-500 focus:ring-0 w-3 h-3"
+                      />
+                      <span>자동 스크롤</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={scrollToBottom}
+                      className="text-[10px] px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded border border-slate-700 transition"
+                    >
+                      맨 아래로
+                    </button>
+                  </div>
                 </div>
                 <div
                   ref={logContainerRef}
-                  className="bg-slate-950 border border-slate-800 rounded-xl p-3 font-mono text-[10px] text-slate-300 h-32 overflow-y-auto custom-scrollbar space-y-1"
+                  onScroll={handleLogScroll}
+                  className="bg-slate-950 border border-slate-800 rounded-xl p-3 font-mono text-[10px] text-slate-300 h-44 overflow-y-auto custom-scrollbar space-y-1"
                 >
                   {status?.logs && status.logs.length > 0 ? (
                     status.logs.map((l, idx) => (

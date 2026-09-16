@@ -1,24 +1,29 @@
 # -*- coding: utf-8 -*-
 """Real-time Incremental Sync Engine for OpenFDA MAUDE Data.
 
-Fetches newly received or changed MDR reports from OpenFDA API,
-performs 3-stage summarization, Annex mapping, and upserts into SQLite DB.
+Fetches newly received or changed MDR reports from OpenFDA API using
+search_after cursor pagination (no 5,000/25,000 limits), performs
+3-stage summarization, Annex mapping, and upserts into SQLite DB.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
+import re
 import sqlite3
 import time
-import urllib.request
+import urllib.parse
 import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 from server.annex_loader import get_device_code, get_patient_code, split_problem_terms
-from server.db_engine import DB_PATH, load_annex_codes
+from server.db_engine import BASE_DIR, DB_PATH, load_annex_codes
 
 log = logging.getLogger("sync_engine")
 
@@ -33,6 +38,23 @@ SYNC_STATE: Dict[str, Any] = {
     "logs": [],
 }
 
+API_KEY_FILES: List[Path] = [
+    BASE_DIR / "FDA_MAUDE_API_KEY.txt",
+    BASE_DIR / "api_key.txt",
+]
+
+
+def load_api_key() -> Optional[str]:
+    for p in API_KEY_FILES:
+        if p.exists():
+            try:
+                key = p.read_text(encoding="utf-8").strip()
+                if key and len(key) >= 10:
+                    return key
+            except Exception:
+                pass
+    return None
+
 
 def get_sync_status() -> Dict[str, Any]:
     return dict(SYNC_STATE)
@@ -42,20 +64,70 @@ def _log(msg: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     formatted = f"[{timestamp}] {msg}"
     SYNC_STATE["logs"].append(formatted)
-    if len(SYNC_STATE["logs"]) > 200:
+    if len(SYNC_STATE["logs"]) > 2000:
         SYNC_STATE["logs"].pop(0)
     log.info(formatted)
 
 
-def fetch_openfda_page(search_query: str, skip: int, limit: int = 100) -> Dict[str, Any]:
-    encoded_search = urllib.parse.quote(search_query)
-    url = f"https://api.fda.gov/device/event.json?search={encoded_search}&skip={skip}&limit={limit}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "FDA-MAUDE-Surveillance-Sync/2.0"}
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+# ---------------------------------------------------------------------------
+# Korean Keyword Summarizer
+# ---------------------------------------------------------------------------
+try:
+    from fda_maude_collector import summarize_korean as _summarize_korean_fn
+    from fda_maude_collector import _resolve_device_category as _resolve_cat_fn
+except ImportError:
+    def _resolve_cat_fn(brand_name: Optional[str]) -> str:
+        if not brand_name:
+            return "CGM"
+        b_upper = brand_name.upper()
+        if any(p in b_upper for p in ["OMNIPOD", "INSULET", "TANDEM", "T:SLIM", "MINIMED", "780G", "MEDTRONIC", "MOBI"]):
+            return "Insulin Pump"
+        return "CGM"
+
+    def _summarize_korean_fn(event_type, p_prob, d_prob, desc, mfr):
+        complaint = f"환자 문제: {p_prob or '없음'} | 기기 문제: {d_prob or '없음'}"
+        response = mfr[:200] if mfr else "제조사 대응 정보 없음"
+        verdict = event_type or "보고 접수"
+        return complaint, response, verdict
+
+
+def parse_next_link(link_header: Optional[str]) -> Optional[str]:
+    """HTTP Link 헤더에서 rel='next' URL을 추출"""
+    if not link_header:
+        return None
+    links = link_header.split(",")
+    for link in links:
+        match = re.search(r'<([^>]+)>;\s*rel="next"', link.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def fetch_openfda_url(
+    session: requests.Session,
+    url: str,
+    api_key: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """OpenFDA API 호출 및 search_after 다음 페이지 URL 반환"""
+    if api_key and "api_key=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}api_key={api_key}"
+
+    headers = {
+        "User-Agent": "FDA-MAUDE-Surveillance-Sync/2.0",
+        "Accept": "application/json",
+    }
+    resp = session.get(url, headers=headers, timeout=45)
+    if resp.status_code == 404:
+        return {"meta": {"results": {"total": 0}}, "results": []}, None
+    if resp.status_code == 429:
+        time.sleep(5)
+        resp = session.get(url, headers=headers, timeout=45)
+    if resp.status_code != 200:
+        raise RuntimeError(f"OpenFDA HTTP {resp.status_code}: {resp.text[:300]}")
+
+    next_link = parse_next_link(resp.headers.get("Link"))
+    return resp.json(), next_link
 
 
 async def run_incremental_sync(
@@ -66,7 +138,7 @@ async def run_incremental_sync(
 ):
     global SYNC_STATE
     if SYNC_STATE["is_running"]:
-        _log("이미 동기화 작업이 진행 중입니다.")
+        _log("⚠️ 이미 동기화 작업이 진행 중입니다.")
         return
 
     SYNC_STATE["is_running"] = True
@@ -78,10 +150,18 @@ async def run_incremental_sync(
     SYNC_STATE["error"] = None
     SYNC_STATE["logs"] = []
 
+    api_key = load_api_key()
+    if api_key:
+        _log(f"🔑 FDA API Key 로드 완료 (끝 4자리: ...{api_key[-4:]})")
+    else:
+        _log("⚠️ API Key가 없습니다. (요청 속도가 제한될 수 있습니다)")
+
     _log("🚀 OpenFDA 데이터 증분 수집 동기화 시작")
 
+    session = requests.Session()
+
     try:
-        # 1. Determine target date range
+        # 1. 수집 대상 날짜 범위 결정
         conn = sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro", uri=True)
         max_db_date = conn.execute("SELECT max(date_received) FROM maude_reports").fetchone()[0]
         conn.close()
@@ -90,187 +170,146 @@ async def run_incremental_sync(
             max_db_date = "2020-01-01"
 
         if mode == "incremental":
-            # Start from the day after max_db_date or recent 14 days
             last_dt = datetime.strptime(max_db_date, "%Y-%m-%d")
+            # 지연 보고서를 포괄하기 위해 마지막 접수일 7일 전부터 수집
             start_date_str = (last_dt - timedelta(days=7)).strftime("%Y%m%d")
             end_date_str = datetime.now().strftime("%Y%m%d")
-            _log(f"📌 최근 증분 수집 범위: {start_date_str} ~ {end_date_str} (기존 DB 최신일: {max_db_date})")
+            _log(f"📌 최근 증분 수집 범위: {start_date_str} ~ {end_date_str} (기존 DB 최신 접수일: {max_db_date})")
         else:
-            start_date_str = (date_from or "2024-01-01").replace("-", "")
-            end_date_str = (date_to or datetime.now().strftime("%Y-%m-%d")).replace("-", "")
-            _log(f"📌 기간 지정 수집 범위: {start_date_str} ~ {end_date_str}")
+            raw_start = str(date_from or "2024-01-01")
+            raw_end = str(date_to or datetime.now().strftime("%Y-%m-%d"))
+            start_date_str = re.sub(r"[^0-9]", "", raw_start)[:8]
+            end_date_str = re.sub(r"[^0-9]", "", raw_end)[:8]
+            if len(start_date_str) < 8:
+                start_date_str = "20240101"
+            if len(end_date_str) < 8:
+                end_date_str = datetime.now().strftime("%Y%m%d")
+            _log(f"📌 기간 지정 수집 범위: {start_date_str} ~ {end_date_str} (입력값: {raw_start} ~ {raw_end})")
 
-        # Construct openFDA search terms
-        brand_terms = "device.brand_name:dexcom+device.brand_name:libre+device.brand_name:omnipod+device.brand_name:medtronic+device.brand_name:tandem"
-        search_query = f"({brand_terms}) AND (date_received:[{start_date_str}+TO+{end_date_str}]+OR+date_changed:[{start_date_str}+TO+{end_date_str}])"
+        # 2. 브랜드별 쿼리 생성
+        if categories and "CGM" in categories and "Insulin Pump" not in categories:
+            brand_terms = 'device.brand_name:dexcom device.brand_name:libre'
+        elif categories and "Insulin Pump" in categories and "CGM" not in categories:
+            brand_terms = 'device.brand_name:omnipod device.brand_name:medtronic device.brand_name:tandem'
+        else:
+            brand_terms = 'device.brand_name:dexcom device.brand_name:libre device.brand_name:omnipod device.brand_name:medtronic device.brand_name:tandem'
+
+        search_query = f'({brand_terms}) AND (date_received:[{start_date_str} TO {end_date_str}])'
 
         _log(f"🔍 OpenFDA 쿼리: {search_query}")
-        SYNC_STATE["current_step"] = "OpenFDA 총 대상 건수 확인 중..."
+        SYNC_STATE["current_step"] = "OpenFDA 대상 건수 확인 중..."
 
-        # Query first page to get total count
-        import urllib.parse
-        try:
-            first_resp = await asyncio.to_thread(fetch_openfda_page, search_query, 0, 1)
-            total_target = first_resp.get("meta", {}).get("results", {}).get("total", 0)
-        except Exception as e:
-            _log(f"⚠️ OpenFDA 대상 건수 조회 결과: 0건 또는 요청 오류 ({e})")
-            total_target = 0
+        limit = 1000 if api_key else 100
+        initial_params = {
+            "search": search_query,
+            "limit": limit,
+            "sort": "date_received:asc"
+        }
+        if api_key:
+            initial_params["api_key"] = api_key
 
-        SYNC_STATE["total_target"] = total_target
-        _log(f"📊 수집 대상 총 보고서: {total_target:,}건")
+        current_url: Optional[str] = f"https://api.fda.gov/device/event.json?{urllib.parse.urlencode(initial_params)}"
 
-        if total_target == 0:
-            _log("✅ 새로운 갱신 데이터가 없습니다. DB가 이미 최신 상태입니다.")
-            SYNC_STATE["current_step"] = "완료 (갱신 데이터 없음)"
-            SYNC_STATE["is_running"] = False
-            return
+        # 3. search_after 커서 페이징을 통한 전수 수집 및 DB 저장
+        from build_maude_v2 import build_rows, INSERT_NARROW, INSERT_TEXT, INSERT_RAW
 
-        # 2. Fetch pages in batches of 100
-        limit = 100
-        skip = 0
         write_conn = sqlite3.connect(DB_PATH)
-        write_conn.execute("PRAGMA journal_mode = WAL")
-        write_conn.execute("PRAGMA synchronous = NORMAL")
+        total_target = 0
+        total_fetched = 0
+        page = 1
 
-        while skip < total_target and skip < 5000: # OpenFDA skip limit is 5000 for standard search
-            SYNC_STATE["current_step"] = f"데이터 수집 중 ({skip:,} ~ {min(skip+limit, total_target):,}건)..."
-            _log(f"📥 {skip:,} ~ {min(skip+limit, total_target):,}건 가져오는 중...")
+        try:
+            write_conn.execute("PRAGMA journal_mode = WAL")
+            write_conn.execute("PRAGMA synchronous = NORMAL")
+            write_conn.execute("PRAGMA cache_size = -1048576")
+            write_conn.execute("PRAGMA temp_store = MEMORY")
 
-            resp = await asyncio.to_thread(fetch_openfda_page, search_query, skip, limit)
-            results = resp.get("results", [])
-            if not results:
-                break
+            while current_url:
+                resp_json, next_link = await asyncio.to_thread(fetch_openfda_url, session, current_url, api_key)
 
-            # Process and upsert batch
-            for item in results:
-                rnum = item.get("report_number")
-                if not rnum:
-                    continue
+                if page == 1:
+                    total_target = resp_json.get("meta", {}).get("results", {}).get("total", 0)
+                    SYNC_STATE["total_target"] = total_target
+                    _log(f"📊 수집 대상 총 보고서: {total_target:,}건")
 
-                # Category classification
-                brand = ""
-                devices = item.get("device", [])
-                if devices:
-                    brand = devices[0].get("brand_name", "")
-                cat = "Insulin Pump" if any(p in brand.upper() for p in ["OMNIPOD", "INSULET", "TANDEM", "T:SLIM", "MINIMED", "780G", "MEDTRONIC", "MOBI"]) else "CGM"
+                    if total_target == 0:
+                        _log("✅ 새로운 갱신 데이터가 없습니다. DB가 이미 openFDA 최신 상태와 동일합니다.")
+                        SYNC_STATE["current_step"] = "완료 (갱신 데이터 없음)"
+                        SYNC_STATE["is_running"] = False
+                        return
+                    else:
+                        _log(f"🔄 search_after 커서 페이징으로 전수 {total_target:,}건을 제한 없이 순차 수집합니다.")
 
-                # Standard problems
-                p_probs = []
-                for p in item.get("patient", []):
-                    for pr in p.get("patient_problems", []):
-                        if pr: p_probs.append(pr)
-                d_probs = item.get("product_problems", []) or []
+                results = resp_json.get("results", [])
+                if not results:
+                    break
 
-                p_str = "; ".join(p_probs) if p_probs else None
-                d_str = "; ".join(d_probs) if d_probs else None
+                # 행 변환 및 DB Upsert
+                narrows = []
+                texts = []
+                raws = []
+                for item in results:
+                    try:
+                        row_data = build_rows(item)
+                        if not row_data:
+                            continue
+                        n, t, r = row_data
+                        narrows.append(n)
+                        texts.append(t)
+                        raws.append(r)
+                    except Exception as row_err:
+                        log.warning("Row parse skipped: %s", row_err)
 
-                # Extract narratives
-                mdr_texts = item.get("mdr_text", [])
-                event_desc = None
-                mfr_narr = None
-                add_mfr_narr = None
-                for t in mdr_texts:
-                    code = t.get("text_type_code", "")
-                    txt = t.get("text", "")
-                    if "DESC" in code.upper() or not event_desc:
-                        event_desc = txt
-                    elif "MFR" in code.upper() or "RESP" in code.upper():
-                        if not mfr_narr:
-                            mfr_narr = txt
-                        else:
-                            add_mfr_narr = txt
+                if narrows:
+                    write_conn.executemany(INSERT_NARROW, narrows)
+                    write_conn.executemany(INSERT_TEXT, texts)
+                    write_conn.executemany(INSERT_RAW, raws)
+                    write_conn.commit()
+                    SYNC_STATE["inserted_count"] += len(narrows)
 
-                date_rec = item.get("date_received", "")
-                if len(date_rec) == 8:
-                    date_rec_fmt = f"{date_rec[:4]}-{date_rec[4:6]}-{date_rec[6:]}"
-                else:
-                    date_rec_fmt = date_rec
+                total_fetched += len(results)
+                SYNC_STATE["processed_count"] = total_fetched
+                SYNC_STATE["current_step"] = f"데이터 수집 중 ({total_fetched:,}건 / 총 {total_target:,}건 완료)..."
+                _log(f"📥 [페이지 {page}] {len(results):,}건 수집 반영 (누적: {total_fetched:,} / {total_target:,}건)")
 
-                date_event = item.get("date_of_event", "")
-                if len(date_event) == 8:
-                    date_event_fmt = f"{date_event[:4]}-{date_event[4:6]}-{date_event[6:]}"
-                else:
-                    date_event_fmt = date_event
+                current_url = next_link
+                page += 1
+                await asyncio.sleep(0.05 if api_key else 0.35)
 
-                # Korean summary fallback
-                summary_complaint = f"환자 증상: {p_str or '정보 없음'} | 기기 결함: {d_str or '정보 없음'}"
-                summary_response = mfr_narr[:300] if mfr_narr else "제조사 대응 정보 없음"
-                summary_conclusion = "추후 후속 보고 예정" if "FOLLOW" in str(item.get("type_of_report", "")).upper() else "조사 완료"
-
-                # 1. Upsert maude_reports
-                write_conn.execute("""
-                    INSERT INTO maude_reports (
-                        report_number, mdr_report_key, event_type, date_received, date_of_event,
-                        date_report, brand_name, device_category, generic_name, manufacturer_name,
-                        manufacturer_country, model_number, product_code, source_type,
-                        report_source_code, type_of_report, patient_problems, product_problems,
-                        summary_complaint_kr, summary_response_kr, summary_conclusion_kr, collected_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(report_number) DO UPDATE SET
-                        event_type = excluded.event_type,
-                        date_received = excluded.date_received,
-                        brand_name = excluded.brand_name,
-                        patient_problems = excluded.patient_problems,
-                        product_problems = excluded.product_problems,
-                        collected_at = excluded.collected_at
-                """, (
-                    rnum, item.get("mdr_report_key"), item.get("event_type"), date_rec_fmt, date_event_fmt,
-                    item.get("date_report"), brand, cat, devices[0].get("generic_name") if devices else "",
-                    item.get("manufacturer_name"), item.get("manufacturer_country"),
-                    devices[0].get("model_number") if devices else "",
-                    devices[0].get("device_report_product_code") if devices else "QBJ",
-                    item.get("source_type"), item.get("report_source_code"), item.get("type_of_report"),
-                    p_str, d_str, summary_complaint, summary_response, summary_conclusion,
-                    datetime.now().isoformat()
-                ))
-
-                # 2. Upsert maude_reports_text
-                write_conn.execute("""
-                    INSERT INTO maude_reports_text (report_number, event_description, manufacturer_narrative, additional_manufacturer_narrative)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(report_number) DO UPDATE SET
-                        event_description = excluded.event_description,
-                        manufacturer_narrative = excluded.manufacturer_narrative,
-                        additional_manufacturer_narrative = excluded.additional_manufacturer_narrative
-                """, (rnum, event_desc, mfr_narr, add_mfr_narr))
-
-                # 3. Upsert maude_reports_raw
-                raw_z = zlib.compress(json.dumps(item).encode("utf-8"), level=6)
-                write_conn.execute("""
-                    INSERT INTO maude_reports_raw (report_number, raw_json_z)
-                    VALUES (?, ?)
-                    ON CONFLICT(report_number) DO UPDATE SET
-                        raw_json_z = excluded.raw_json_z
-                """, (rnum, raw_z))
-
-                SYNC_STATE["inserted_count"] += 1
-
+            # 4. 업데이트된 기간의 월별 요약 테이블 재색인
+            SYNC_STATE["current_step"] = "시계열 요약 통계(maude_monthly_summary) 재색인 중..."
+            _log("📊 월별 통계 서머리 테이블 갱신 중...")
+            start_ym = f"{start_date_str[:4]}-{start_date_str[4:6]}"
+            end_ym = f"{end_date_str[:4]}-{end_date_str[4:6]}"
+            write_conn.execute("DELETE FROM maude_monthly_summary WHERE month >= ? AND month <= ?", (start_ym, end_ym))
+            write_conn.execute("""
+                INSERT INTO maude_monthly_summary
+                    (month, brand_name, event_type, device_category, report_count)
+                SELECT substr(date_received, 1, 7) AS month,
+                       COALESCE(brand_name, '') AS brand_name,
+                       COALESCE(event_type, '') AS event_type,
+                       device_category,
+                       COUNT(*) AS report_count
+                  FROM maude_reports
+                 WHERE date_received IS NOT NULL AND date_received <> ''
+                   AND substr(date_received, 1, 7) >= ?
+                   AND substr(date_received, 1, 7) <= ?
+                 GROUP BY 1, 2, 3, 4
+            """, (start_ym, end_ym))
             write_conn.commit()
-            skip += limit
-            SYNC_STATE["processed_count"] = min(skip, total_target)
-            await asyncio.sleep(0.2) # Friendly rate-limit
+        finally:
+            write_conn.close()
 
-        # 3. Rebuild summary table for updated months
-        SYNC_STATE["current_step"] = "시계열 요약 통계(maude_monthly_summary) 재색인 중..."
-        _log("📊 월별 통계 서머리 테이블 갱신 중...")
-        write_conn.execute("""
-            INSERT OR REPLACE INTO maude_monthly_summary (year_month, brand_name, device_category, event_type, report_source_code, report_count)
-            SELECT strftime('%Y-%m', date_received) as ym, brand_name, device_category, event_type,
-                   COALESCE(report_source_code, 'Unknown'), count(*)
-            FROM maude_reports
-            WHERE strftime('%Y-%m', date_received) >= ?
-            GROUP BY ym, brand_name, device_category, event_type, report_source_code
-        """, (f"{start_date_str[:4]}-{start_date_str[4:6]}",))
-        write_conn.commit()
-        write_conn.close()
-
-        # Invalidate metadata cache
+        # 캐시 초기화
         from server.db_engine import FILTER_METADATA_CACHE_PATH
         if FILTER_METADATA_CACHE_PATH.exists():
-            FILTER_METADATA_CACHE_PATH.unlink()
+            try:
+                FILTER_METADATA_CACHE_PATH.unlink()
+            except Exception:
+                pass
 
         elapsed = time.time() - SYNC_STATE["start_time"]
-        _log(f"🎉 동기화 완료! 총 {SYNC_STATE['inserted_count']:,}건의 최신 보고서가 성공적으로 반영되었습니다. ({elapsed:.1f}초 소요)")
+        _log(f"🎉 동기화 완료! 총 {SYNC_STATE['inserted_count']:,}건의 보고서가 성공적으로 반영되었습니다. ({elapsed:.1f}초 소요)")
         SYNC_STATE["current_step"] = "동기화 완료"
 
     except Exception as e:

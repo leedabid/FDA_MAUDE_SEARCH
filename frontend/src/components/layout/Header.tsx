@@ -9,6 +9,8 @@ import {
   Database,
   Cpu,
   Star,
+  ShieldAlert,
+  ShieldCheck,
 } from "lucide-react";
 
 interface HeaderProps {
@@ -32,6 +34,8 @@ export const Header: React.FC<HeaderProps> = ({
     { id: "overview", label: "종합 개요", icon: BarChart3 },
     { id: "reports", label: "전체 보고서", icon: FileText },
     { id: "monthly", label: "월별 추이", icon: TrendingUp },
+    { id: "hazards", label: "위해 분석", icon: ShieldAlert },
+    { id: "confirmed_hazards", label: "확정 위해 항목", icon: ShieldCheck },
     { id: "codes", label: "문제 코드 (Annex)", icon: AlertTriangle },
     { id: "insights", label: "안전성 인사이트", icon: Lightbulb },
     { id: "bookmarks", label: "⭐ 보관함 & 태그", icon: Star, badge: bookmarkCount },

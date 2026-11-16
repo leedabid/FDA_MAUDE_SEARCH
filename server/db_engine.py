@@ -83,10 +83,11 @@ reload_brand_groups()
 
 def get_sqlite_conn(readonly: bool = True) -> sqlite3.Connection:
     if readonly:
-        conn = sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro", uri=True)
+        conn = sqlite3.connect(f"{DB_PATH.as_uri()}?mode=ro", uri=True, timeout=30.0)
     else:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute(f"PRAGMA cache_size = -{_PRAGMA_CACHE_KIB // 1024}")
     conn.execute(f"PRAGMA mmap_size = {_PRAGMA_MMAP_BYTES}")
     conn.execute("PRAGMA temp_store = MEMORY")
@@ -112,7 +113,7 @@ def _build_filter_clauses(
             clauses.append(f"{prefix}device_category = ?")
             params.append(valid_cats[0])
 
-    # 2. Brand Name Filter (expands canonical groups if selected)
+    # 2. Brand Name Filter (expands canonical groups if selected, case-insensitive)
     if brands:
         all_raw_targets = set()
         for b in brands:
@@ -120,19 +121,29 @@ def _build_filter_clauses(
             # If b matches a canonical group
             matched_canon = None
             for c_group in CANONICAL_TO_MEMBERS:
-                if c_group.lower() == b_norm.lower():
+                if (
+                    c_group.lower() == b_norm.lower()
+                    or c_group.lower().replace("+", " plus") == b_norm.lower().replace("+", " plus")
+                    or c_group.lower().replace(" plus", "+") == b_norm.lower().replace(" plus", "+")
+                ):
                     matched_canon = c_group
                     break
-            
+
             if matched_canon:
+                all_raw_targets.add(matched_canon.upper().strip())
+                all_raw_targets.add(b_norm.upper().strip())
+                if "+" in matched_canon:
+                    all_raw_targets.add(matched_canon.replace("+", " Plus").upper().strip())
+                elif " plus" in matched_canon.lower():
+                    all_raw_targets.add(matched_canon.replace(" Plus", "+").replace(" plus", "+").upper().strip())
                 for member in CANONICAL_TO_MEMBERS[matched_canon]:
-                    all_raw_targets.add(member)
+                    all_raw_targets.add(member.upper().strip())
             else:
-                all_raw_targets.add(b_norm)
+                all_raw_targets.add(b_norm.upper().strip())
 
         if all_raw_targets:
             placeholders = ",".join(["?"] * len(all_raw_targets))
-            clauses.append(f"{prefix}brand_name IN ({placeholders})")
+            clauses.append(f"UPPER({prefix}brand_name) IN ({placeholders})")
             params.extend(list(all_raw_targets))
 
     # 3. Event Types
@@ -193,6 +204,16 @@ def get_metadata() -> Dict[str, Any]:
             "SELECT min(month), max(month) FROM maude_monthly_summary"
         ).fetchone()
 
+        max_date_row = conn.execute(
+            "SELECT date_received FROM maude_reports WHERE date_received IS NOT NULL ORDER BY date_received DESC LIMIT 1"
+        ).fetchone()
+        actual_max_date = max_date_row[0] if max_date_row and max_date_row[0] else (date_bounds[1] + "-30" if date_bounds and date_bounds[1] else "2026-09-30")
+
+        min_date_row = conn.execute(
+            "SELECT date_received FROM maude_reports WHERE date_received >= '2020-01-01' ORDER BY date_received ASC LIMIT 1"
+        ).fetchone()
+        actual_min_date = min_date_row[0] if min_date_row and min_date_row[0] else (date_bounds[0] + "-01" if date_bounds and date_bounds[0] else "2020-01-01")
+
         all_brands = [
             r[0]
             for r in conn.execute(
@@ -232,8 +253,8 @@ def get_metadata() -> Dict[str, Any]:
     meta = {
         "db_path": str(DB_PATH),
         "total_reports": total_reports,
-        "min_date": (date_bounds[0] + "-01") if date_bounds and date_bounds[0] else "2020-01-01",
-        "max_date": (date_bounds[1] + "-28") if date_bounds and date_bounds[1] else "2026-08-31",
+        "min_date": actual_min_date,
+        "max_date": actual_max_date,
         "categories": ["CGM", "Insulin Pump"],
         "canonical_brands": canonical_brands,
         "canonical_brands_by_category": {
@@ -476,13 +497,25 @@ def query_reports(
 
     where_sql = " AND ".join(clauses) if clauses else "1=1"
 
+    # Optimization: Determine optimal index hint to avoid full table sort when filtering by category, event_type, or date
+    index_hint = ""
+    if event_types and ("Death" in event_types or (len(event_types) == 1 and event_types[0] != "Malfunction")):
+        index_hint = "INDEXED BY idx_reports_event_date"
+    elif sort_by in ("date_received", "date_of_event", "event_type") or not sort_by:
+        if event_types and len(event_types) == 1:
+            index_hint = "INDEXED BY idx_reports_event_date"
+        elif categories and len(categories) == 1 and not brands and not event_types:
+            index_hint = "INDEXED BY idx_reports_cat_date"
+        elif not categories and not brands and not event_types and not keyword:
+            index_hint = "INDEXED BY idx_reports_date"
+
     # CTE Late Join Pattern: Page first from indexed table, then join text table only for the 50 rows
     data_sql = f"""
         WITH paged AS (
             SELECT r.report_number, r.mdr_report_key, r.event_type, r.date_received, r.date_of_event,
                    r.brand_name, r.device_category, r.manufacturer_name, r.patient_problems, r.product_problems,
                    r.summary_complaint_kr, r.summary_response_kr, r.summary_conclusion_kr
-            FROM maude_reports r
+            FROM maude_reports r {index_hint}
             WHERE {where_sql}
             ORDER BY {order_col} {order_dir}
             LIMIT ? OFFSET ?
@@ -495,8 +528,6 @@ def query_reports(
         LEFT JOIN maude_reports_text t ON t.report_number = p.report_number
     """
 
-    count_sql = f"SELECT count(*) FROM (SELECT 1 FROM maude_reports r WHERE {where_sql} LIMIT 2000)"
-
     with get_sqlite_conn() as conn:
         cursor = conn.execute(data_sql, params + [page_size, offset])
         rows = []
@@ -506,7 +537,27 @@ def query_reports(
             row_dict["has_narrative"] = has_narr
             rows.append(row_dict)
 
-        total_count = conn.execute(count_sql, params).fetchone()[0]
+        # Total count calculation:
+        # If no free-text or code filter, fetch exact count instantly from maude_monthly_summary
+        total_count = 0
+        if not kw and not code_filter and not report_numbers:
+            s_clauses, s_params = _build_filter_clauses(
+                categories=categories,
+                brands=brands,
+                event_types=event_types,
+                date_from=date_from,
+                date_to=date_to,
+                prefix="s.",
+            )
+            s_where = " AND ".join(s_clauses) if s_clauses else "1=1"
+            row = conn.execute(
+                f"SELECT COALESCE(sum(s.report_count), 0) FROM maude_monthly_summary s WHERE {s_where}",
+                s_params,
+            ).fetchone()
+            total_count = int(row[0]) if row and row[0] is not None else 0
+        else:
+            count_sql = f"SELECT count(*) FROM (SELECT 1 FROM maude_reports r {index_hint} WHERE {where_sql} LIMIT 5000)"
+            total_count = conn.execute(count_sql, params).fetchone()[0]
 
     return {
         "total": total_count,
@@ -896,3 +947,389 @@ def save_brand_groups(groups: Dict[str, List[str]], categories: Optional[Dict[st
     except Exception as e:
         log.error(f"Failed to save brand_groups.json: {e}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# ISO 14971 MAUDE Hazard Intelligence Engine
+# ---------------------------------------------------------------------------
+def init_hazard_table():
+    """Initializes the maude_hazards table and indices if they do not exist."""
+    with get_sqlite_conn(readonly=False) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS maude_hazards (
+                hazard_row_id TEXT PRIMARY KEY,
+                report_number TEXT NOT NULL,
+                brand_name TEXT,
+                device_category TEXT,
+                event_type TEXT,
+                date_received TEXT,
+                manufacturer_name TEXT,
+                hazard_id_local TEXT,
+                hazard_category_primary TEXT,
+                hazard_ko TEXT,
+                initiating_event_ko TEXT,
+                hazardous_situation_ko TEXT,
+                harm_ko TEXT,
+                severity_level TEXT,
+                probability_level TEXT,
+                risk_level TEXT,
+                cgm_relevance_score INTEGER DEFAULT 0,
+                pump_relevance_score INTEGER DEFAULT 0,
+                aid_relevance_score INTEGER DEFAULT 0,
+                patient_risk_score INTEGER DEFAULT 0,
+                fda_action_summary_ko TEXT,
+                care_sens_implication_ko TEXT,
+                isens_preparation_ko TEXT,
+                recommended_preventive_controls TEXT,
+                recommended_recall_controls TEXT,
+                workflow_status TEXT DEFAULT '미검토',
+                reviewer_name TEXT DEFAULT '',
+                review_note TEXT DEFAULT '',
+                internal_tags TEXT DEFAULT '',
+                created_at TEXT,
+                updated_at TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_maude_hazards_rep_num ON maude_hazards(report_number)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_maude_hazards_workflow ON maude_hazards(workflow_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_maude_hazards_risk ON maude_hazards(risk_level)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_maude_hazards_aid_score ON maude_hazards(aid_relevance_score)")
+
+
+def get_hazards(filters: Dict[str, Any], confirmed_only: bool = False) -> List[Dict[str, Any]]:
+    """Retrieves ISO 14971 hazard list with domain filters."""
+    init_hazard_table()
+    where_parts = []
+    params = []
+
+    if confirmed_only:
+        where_parts.append("(h.workflow_status = '검토완료' OR h.workflow_status = '확정')")
+
+    if filters.get("hazard_category"):
+        where_parts.append("h.hazard_category_primary = ?")
+        params.append(filters["hazard_category"])
+
+    if filters.get("risk_level"):
+        where_parts.append("h.risk_level = ?")
+        params.append(filters["risk_level"])
+
+    if filters.get("min_aid_score") is not None and str(filters["min_aid_score"]).isdigit() and int(filters["min_aid_score"]) > 0:
+        where_parts.append("h.aid_relevance_score >= ?")
+        params.append(int(filters["min_aid_score"]))
+
+    if filters.get("workflow_status"):
+        where_parts.append("h.workflow_status = ?")
+        params.append(filters["workflow_status"])
+
+    if filters.get("keyword") and str(filters["keyword"]).strip():
+        kw = f"%{filters['keyword'].strip()}%"
+        where_parts.append(
+            "(h.hazard_ko LIKE ? OR h.initiating_event_ko LIKE ? OR "
+            "h.hazardous_situation_ko LIKE ? OR h.harm_ko LIKE ? OR "
+            "h.care_sens_implication_ko LIKE ? OR h.report_number LIKE ? OR h.brand_name LIKE ?)"
+        )
+        params.extend([kw, kw, kw, kw, kw, kw, kw])
+
+    where_sql = " AND ".join(where_parts) if where_parts else "1=1"
+
+    query = f"""
+        SELECT h.*,
+               COALESCE(r.patient_problems, '') as patient_problems,
+               COALESCE(r.product_problems, '') as product_problems,
+               COALESCE(r.summary_complaint_kr, '') as summary_complaint_kr
+        FROM maude_hazards h
+        LEFT JOIN maude_reports r ON h.report_number = r.report_number
+        WHERE {where_sql}
+        ORDER BY h.aid_relevance_score DESC, h.risk_level DESC, h.created_at DESC
+        LIMIT 500
+    """
+
+    with get_sqlite_conn() as conn:
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_confirmed_hazards(filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Retrieves only approved/confirmed hazard items for final RMF matrix."""
+    return get_hazards(filters=filters, confirmed_only=True)
+
+
+def get_reports_hazard_status(report_numbers: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Returns mapping of report_number -> {has_hazard, hazard_status, hazard_count} for UI list."""
+    if not report_numbers:
+        return {}
+    init_hazard_table()
+    placeholders = ",".join(["?"] * len(report_numbers))
+    query = f"""
+        SELECT report_number,
+               count(*) as hazard_count,
+               max(workflow_status) as status_max,
+               min(workflow_status) as status_min
+        FROM maude_hazards
+        WHERE report_number IN ({placeholders})
+        GROUP BY report_number
+    """
+    result: Dict[str, Dict[str, Any]] = {}
+    with get_sqlite_conn() as conn:
+        rows = conn.execute(query, report_numbers).fetchall()
+        for r in rows:
+            rn = r[0]
+            cnt = r[1]
+            s_max = r[2]
+            s_min = r[3]
+            status = "검토완료" if s_max == "검토완료" and s_min == "검토완료" else ("부분검토" if "검토완료" in (s_max, s_min) else "미검토")
+            result[rn] = {
+                "has_hazard": cnt > 0,
+                "hazard_count": cnt,
+                "hazard_status": status,
+            }
+    return result
+
+
+def save_hazard_review(
+    hazard_row_id: str,
+    workflow_status: str,
+    reviewer_name: str,
+    review_note: str,
+    internal_tags: str = "",
+) -> Dict[str, Any]:
+    """Updates review workflow status, reviewer, and notes for a specific hazard."""
+    init_hazard_table()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_sqlite_conn(readonly=False) as conn:
+        conn.execute("""
+            UPDATE maude_hazards
+               SET workflow_status = ?,
+                   reviewer_name = ?,
+                   review_note = ?,
+                   internal_tags = ?,
+                   updated_at = ?
+             WHERE hazard_row_id = ?
+        """, (workflow_status, reviewer_name, review_note, internal_tags, now_str, hazard_row_id))
+    return {"success": True, "hazard_row_id": hazard_row_id, "workflow_status": workflow_status}
+
+
+def save_hazard_review_batch(
+    report_numbers: List[str],
+    workflow_status: str,
+    reviewer_name: str,
+    review_note: str,
+    internal_tags: str = "",
+) -> int:
+    """Updates review workflow status in bulk for all hazards under the given report numbers."""
+    if not report_numbers:
+        return 0
+    init_hazard_table()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    placeholders = ",".join(["?"] * len(report_numbers))
+    query = f"""
+        UPDATE maude_hazards
+           SET workflow_status = ?,
+               reviewer_name = ?,
+               review_note = ?,
+               internal_tags = ?,
+               updated_at = ?
+         WHERE report_number IN ({placeholders})
+    """
+    params = [workflow_status, reviewer_name, review_note, internal_tags, now_str] + report_numbers
+    with get_sqlite_conn(readonly=False) as conn:
+        cursor = conn.execute(query, params)
+        return cursor.rowcount
+
+
+def delete_hazard(hazard_row_id: str) -> bool:
+    """Deletes a single hazard row from maude_hazards."""
+    init_hazard_table()
+    with get_sqlite_conn(readonly=False) as conn:
+        cursor = conn.execute("DELETE FROM maude_hazards WHERE hazard_row_id = ?", (hazard_row_id,))
+        return cursor.rowcount > 0
+
+
+def delete_hazards_by_report(report_number: str) -> int:
+    """Deletes all hazards for a specific report_number."""
+    init_hazard_table()
+    with get_sqlite_conn(readonly=False) as conn:
+        cursor = conn.execute("DELETE FROM maude_hazards WHERE report_number = ?", (report_number,))
+        return cursor.rowcount
+
+
+def export_hazards_to_excel(
+    filters: Dict[str, Any],
+    export_type: str = "final",  # "final" | "operations"
+    confirmed_only: bool = False,
+) -> bytes:
+    """Generates styled professional Excel workbook for ISO 14971 final hazards or operational matrix."""
+    import io
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    hazards = get_hazards(filters=filters, confirmed_only=confirmed_only)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+
+    font_family = "맑은 고딕"
+    header_font = Font(name=font_family, size=10, bold=True, color="FFFFFF")
+    data_font = Font(name=font_family, size=9)
+    bold_data_font = Font(name=font_family, size=9, bold=True)
+
+    header_fill = PatternFill(start_color="0F172A", end_color="0F172A", fill_type="solid")  # Slate 900
+    thin_border_side = Side(border_style="thin", color="CBD5E1")
+    border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    if export_type == "final":
+        ws.title = "ISO 14971 최종 위해 분석"
+        headers = [
+            "MDR 보고서 번호",
+            "제품명 (Brand)",
+            "의료기기 분류",
+            "부작용 유형",
+            "접수일자",
+            "Hazard ID",
+            "위해 분류 (Category)",
+            "위해 요인 (Hazard)",
+            "원인 사건 (Initiating Event)",
+            "위해 상황 (Hazardous Situation)",
+            "환자 위해 (Harm)",
+            "심각도 (S)",
+            "발생확률 (P)",
+            "위험 수준 (Risk Level)",
+            "AID 연동 관련도 (1-5)",
+            "CareSens Air / AID 시사점",
+            "권장 설계 예방 통제안 (Preventive Controls)",
+            "검토 의견 (Review Note)",
+        ]
+        ws.append(headers)
+
+        for r in hazards:
+            row_data = [
+                r.get("report_number") or "",
+                r.get("brand_name") or "",
+                r.get("device_category") or "",
+                r.get("event_type") or "",
+                r.get("date_received") or "",
+                r.get("hazard_id_local") or r.get("hazard_row_id") or "",
+                r.get("hazard_category_primary") or "",
+                r.get("hazard_ko") or "",
+                r.get("initiating_event_ko") or "",
+                r.get("hazardous_situation_ko") or "",
+                r.get("harm_ko") or "",
+                r.get("severity_level") or "",
+                r.get("probability_level") or "",
+                r.get("risk_level") or "",
+                r.get("aid_relevance_score") or 0,
+                r.get("care_sens_implication_ko") or "",
+                r.get("recommended_preventive_controls") or "",
+                r.get("review_note") or "",
+            ]
+            ws.append(row_data)
+
+    else:  # "operations"
+        ws.title = "위해 분석 사내 운영 매트릭스"
+        headers = [
+            "Hazard Row ID",
+            "MDR 보고서 번호",
+            "제품명",
+            "부작용",
+            "접수일",
+            "위해 요인",
+            "원인 사건",
+            "위해 상황",
+            "환자 위해",
+            "위험 수준",
+            "AID 관련도",
+            "검토 상태 (Status)",
+            "검토자 (Reviewer)",
+            "검토 의견 (Note)",
+            "사내 태그 (Tags)",
+            "생성일시",
+            "수정일시",
+        ]
+        ws.append(headers)
+
+        for r in hazards:
+            row_data = [
+                r.get("hazard_row_id") or "",
+                r.get("report_number") or "",
+                r.get("brand_name") or "",
+                r.get("event_type") or "",
+                r.get("date_received") or "",
+                r.get("hazard_ko") or "",
+                r.get("initiating_event_ko") or "",
+                r.get("hazardous_situation_ko") or "",
+                r.get("harm_ko") or "",
+                r.get("risk_level") or "",
+                r.get("aid_relevance_score") or 0,
+                r.get("workflow_status") or "미검토",
+                r.get("reviewer_name") or "",
+                r.get("review_note") or "",
+                r.get("internal_tags") or "",
+                r.get("created_at") or "",
+                r.get("updated_at") or "",
+            ]
+            ws.append(row_data)
+
+    # Styling Header
+    ws.row_dimensions[1].height = 28
+    for col_num in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_num)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = align_center
+        cell.border = border
+
+    # Styling Rows
+    risk_fills = {
+        "High": PatternFill(start_color="FFE4E6", end_color="FFE4E6", fill_type="solid"),     # Rose 100
+        "Medium": PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid"),   # Amber 100
+        "Low": PatternFill(start_color="E0F2FE", end_color="E0F2FE", fill_type="solid"),      # Sky 100
+    }
+    status_fills = {
+        "검토완료": PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid"),  # Emerald 100
+        "확정": PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid"),
+        "미검토": PatternFill(start_color="F1F5F9", end_color="F1F5F9", fill_type="solid"),   # Slate 100
+        "보류": PatternFill(start_color="FEF9C3", end_color="FEF9C3", fill_type="solid"),
+        "제외": PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid"),
+    }
+
+    for row_idx in range(2, len(hazards) + 2):
+        ws.row_dimensions[row_idx].height = 24
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = data_font
+            cell.border = border
+            header_name = headers[col_idx - 1]
+
+            if any(k in header_name for k in ["번호", "ID", "일자", "일시", "수준", "분류", "상태", "검토자", "관련도", "S", "P"]):
+                cell.alignment = align_center
+            else:
+                cell.alignment = align_left
+
+            # Highlight Risk Level
+            if "위험 수준" in header_name and cell.value in risk_fills:
+                cell.fill = risk_fills[cell.value]
+                cell.font = bold_data_font
+
+            # Highlight Status
+            if "상태" in header_name and cell.value in status_fills:
+                cell.fill = status_fills[cell.value]
+                cell.font = bold_data_font
+
+    # Column Widths
+    for col in ws.columns:
+        col_letter = get_column_letter(col[0].column)
+        max_len = 0
+        for cell in col:
+            val_str = str(cell.value or "")
+            first_line = val_str.split("\n")[0]
+            max_len = max(max_len, len(first_line.encode("utf-8", "ignore")))
+        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 12), 45)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
+

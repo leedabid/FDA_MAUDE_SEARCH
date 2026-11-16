@@ -22,6 +22,8 @@ echo [*] Starting Server at http://localhost:8000 ...
 echo [*] Web browser will open automatically once the server is ready.
 echo.
 
+".venv\Scripts\python.exe" "..\..\dashboard_run_snapshot.py" MAUDE "."
+
 ".venv\Scripts\python.exe" -m uvicorn server.main:app --host 127.0.0.1 --port 8000 --reload
 
 echo.

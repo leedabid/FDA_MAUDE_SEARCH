@@ -239,10 +239,14 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
 
   // Active filter helper text
   const activeCategories = filters?.categories?.length ? filters.categories.join(", ") : "전체 카테고리";
+  const minMonth = metadata?.min_date ? metadata.min_date.slice(0, 7).replace("-", ".") : "2020.01";
+  const maxMonth = metadata?.max_date ? metadata.max_date.slice(0, 7).replace("-", ".") : "";
   const activeDateRange =
     filters?.date_from || filters?.date_to
       ? `${filters.date_from || "시작"} ~ ${filters.date_to || "현재"}`
-      : "전체 수집 기간 (2020.01 ~ 2026.08)";
+      : maxMonth
+      ? `전체 수집 기간 (${minMonth} ~ ${maxMonth})`
+      : "전체 수집 기간";
   const activeEventTypes = filters?.event_types?.length ? filters.event_types.join(", ") : "전체 부작용 유형";
   const activeBrands =
     !filters?.brands || filters.brands.length === 0
@@ -263,7 +267,7 @@ export const OverviewTab: React.FC<OverviewTabProps> = ({
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs font-bold text-white">데이터베이스 수집 범위</span>
               <span className="text-[11px] px-2 py-0.5 rounded-md bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 font-mono">
-                {metadata?.min_date || "2020-01"} ~ {metadata?.max_date || "2026-08"} (총 {metadata?.total_reports?.toLocaleString() || "3,979,575"}건)
+                {metadata?.min_date || "2020-01-02"} ~ {metadata?.max_date || "현재"} (총 {metadata?.total_reports?.toLocaleString() || "0"}건)
               </span>
               <button
                 type="button"

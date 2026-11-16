@@ -146,7 +146,7 @@ export const SyncModal: React.FC<SyncModalProps> = ({
             <div>
               <span className="text-slate-500 block text-[11px] mb-0.5">DB 데이터 수집 기간</span>
               <span className="font-mono font-semibold text-indigo-300">
-                {metadata?.min_date || "2020-01"} ~ {metadata?.max_date || "2026-08"}
+                {metadata?.min_date || "2020-01-02"} ~ {metadata?.max_date || "현재"}
               </span>
             </div>
             <div>

@@ -7,6 +7,8 @@ import { MonthlyTrendTab } from "./components/tabs/MonthlyTrendTab";
 import { ProblemCodesTab } from "./components/tabs/ProblemCodesTab";
 import { InsightsTab } from "./components/tabs/InsightsTab";
 import { BookmarksTab } from "./components/tabs/BookmarksTab";
+import { HazardTab } from "./components/tabs/HazardTab";
+import { ConfirmedHazardsTab } from "./components/tabs/ConfirmedHazardsTab";
 import { BrandGroupManagerModal } from "./components/modals/BrandGroupManagerModal";
 import { SyncModal } from "./components/modals/SyncModal";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -192,6 +194,7 @@ export const App: React.FC = () => {
                 filters={appliedFilters}
                 selectedReportNumber={selectedReportNumber}
                 onClearSelectedReport={() => setSelectedReportNumber(null)}
+                metadata={metadata}
               />
             )}
 
@@ -200,6 +203,24 @@ export const App: React.FC = () => {
                 data={monthlyStats}
                 loading={loadingMonthly}
                 metadata={metadata}
+              />
+            )}
+
+            {activeTab === "hazards" && (
+              <HazardTab
+                onSelectReport={(rnum) => {
+                  setSelectedReportNumber(rnum);
+                  setActiveTab("reports");
+                }}
+              />
+            )}
+
+            {activeTab === "confirmed_hazards" && (
+              <ConfirmedHazardsTab
+                onSelectReport={(rnum) => {
+                  setSelectedReportNumber(rnum);
+                  setActiveTab("reports");
+                }}
               />
             )}
 

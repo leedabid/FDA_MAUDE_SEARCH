@@ -20,9 +20,15 @@ import {
   LayoutGrid,
   Hash,
   Download,
+  FolderPlus,
+  Settings2,
+  Copy,
+  Loader2,
 } from "lucide-react";
+import * as echarts from "echarts";
 import ReactECharts from "echarts-for-react";
 import type { MonthlyDataPoint, Metadata } from "../../types";
+import { CustomTrendGroupModal, type CustomTrendGroup } from "../modals/CustomTrendGroupModal";
 
 interface MonthlyTrendTabProps {
   data: MonthlyDataPoint[];
@@ -97,7 +103,7 @@ const BRAND_COLOR_PALETTE = [
   "#64748b", // Slate
 ];
 
-export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading }) => {
+export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading, metadata }) => {
   const [groupBy, setGroupBy] = useState<GroupBy>("event_brand_breakdown");
   const [targetEventType, setTargetEventType] = useState<string>("Malfunction");
   const [chartType, setChartType] = useState<ChartType>("share"); // Default to 100% Share
@@ -110,6 +116,94 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
   const [topLimit, setTopLimit] = useState<number>(10);
   const [chartHeight, setChartHeight] = useState<number>(380);
   const [disabledSeries, setDisabledSeries] = useState<Record<string, boolean>>({});
+
+  // Custom Trend Groups state (persisted in localStorage)
+  const [customGroups, setCustomGroups] = useState<CustomTrendGroup[]>(() => {
+    try {
+      const saved = localStorage.getItem("maude_custom_trend_groups");
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const [isCustomGroupEnabled, setIsCustomGroupEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("maude_custom_trend_group_enabled") === "true";
+    } catch {
+      return false;
+    }
+  });
+
+  const [hideUngrouped, setHideUngrouped] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem("maude_custom_group_hide_ungrouped");
+      return saved !== null ? saved === "true" : true;
+    } catch {
+      return true;
+    }
+  });
+
+  const [isGroupModalOpen, setIsGroupModalOpen] = useState<boolean>(false);
+
+  const handleSaveCustomGroups = (newGroups: CustomTrendGroup[]) => {
+    setCustomGroups(newGroups);
+    localStorage.setItem("maude_custom_trend_groups", JSON.stringify(newGroups));
+    if (newGroups.length > 0) {
+      setIsCustomGroupEnabled(true);
+      localStorage.setItem("maude_custom_trend_group_enabled", "true");
+    } else {
+      setIsCustomGroupEnabled(false);
+      localStorage.setItem("maude_custom_trend_group_enabled", "false");
+    }
+    setDisabledSeries({});
+  };
+
+  const handleToggleCustomGroupEnabled = (enabled: boolean) => {
+    setIsCustomGroupEnabled(enabled);
+    localStorage.setItem("maude_custom_trend_group_enabled", enabled ? "true" : "false");
+    setDisabledSeries({});
+  };
+
+  const handleToggleHideUngrouped = (hide: boolean) => {
+    setHideUngrouped(hide);
+    localStorage.setItem("maude_custom_group_hide_ungrouped", hide ? "true" : "false");
+    setDisabledSeries({});
+  };
+
+  // Available brands for group modal
+  const availableBrands = useMemo(() => {
+    const brandSet = new Set<string>();
+    if (data && data.length > 0) {
+      data.forEach((d) => {
+        const b = brandMode === "canonical" ? d.brand_name : (d.raw_brand_name || d.brand_name);
+        if (b && b !== "Unknown") brandSet.add(b);
+      });
+    }
+    if (metadata) {
+      const sourceList = brandMode === "canonical" ? metadata.canonical_brands : metadata.all_brands;
+      if (sourceList && Array.isArray(sourceList)) {
+        sourceList.forEach((b: string) => {
+          if (b && b !== "Unknown") brandSet.add(b);
+        });
+      }
+    }
+    return Array.from(brandSet).sort();
+  }, [data, metadata, brandMode]);
+
+  // Fast lookup mapping brand -> custom group name
+  const brandToGroupMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    if (!isCustomGroupEnabled || customGroups.length === 0) return map;
+
+    customGroups.forEach((g) => {
+      g.brands.forEach((b) => {
+        map[b] = g.name;
+        map[b.toLowerCase()] = g.name;
+      });
+    });
+    return map;
+  }, [isCustomGroupEnabled, customGroups]);
 
   const isLight = themeMode === "light";
 
@@ -174,19 +268,44 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
     const rawCounts: Record<string, Record<string, number>> = {};
     let totalSum = 0;
 
+    const useCustomGrouping = isCustomGroupEnabled && customGroups.length > 0 && groupBy !== "event_type";
+
     filteredData.forEach((d) => {
       const tKey = formatTimeKey(d.month, timeGrain);
       if (!tKey || tKey === "Unknown" || tKey < "2020") return;
-
-      timeSet.add(tKey);
 
       let groupKey = "Unknown";
       if (groupBy === "event_type") {
         groupKey = d.event_type || "Unknown";
       } else {
-        groupKey = (brandMode === "canonical" ? d.brand_name : (d.raw_brand_name || d.brand_name)) || "Unknown";
+        const rawOrCanonical = (brandMode === "canonical" ? d.brand_name : (d.raw_brand_name || d.brand_name)) || "Unknown";
+        const canonical = d.brand_name || "";
+        const raw = d.raw_brand_name || "";
+
+        if (useCustomGrouping) {
+          const matched =
+            brandToGroupMap[rawOrCanonical] ||
+            brandToGroupMap[rawOrCanonical.toLowerCase()] ||
+            brandToGroupMap[canonical] ||
+            brandToGroupMap[canonical.toLowerCase()] ||
+            brandToGroupMap[raw] ||
+            brandToGroupMap[raw.toLowerCase()];
+
+          if (matched) {
+            groupKey = matched;
+          } else {
+            if (hideUngrouped) {
+              return; // Skip records not in any user custom group
+            } else {
+              groupKey = rawOrCanonical;
+            }
+          }
+        } else {
+          groupKey = rawOrCanonical;
+        }
       }
 
+      timeSet.add(tKey);
       groupCountMap[groupKey] = (groupCountMap[groupKey] || 0) + d.count;
       totalSum += d.count;
 
@@ -205,6 +324,14 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
         ...order.filter((o) => existing.includes(o)),
         ...existing.filter((e) => !order.includes(e)),
       ];
+    } else if (useCustomGrouping) {
+      const customGroupNames = customGroups.map((g) => g.name);
+      const activeCustom = customGroupNames.filter((name) => groupCountMap[name] !== undefined);
+      const others = Object.entries(groupCountMap)
+        .filter(([k]) => !customGroupNames.includes(k))
+        .sort((a, b) => b[1] - a[1])
+        .map(([k]) => k);
+      sortedSeries = [...activeCustom, ...others].slice(0, topLimit);
     } else {
       sortedSeries = Object.entries(groupCountMap)
         .sort((a, b) => b[1] - a[1])
@@ -222,7 +349,7 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
       totalSeriesCounts: groupCountMap,
       overallTargetTotal: totalSum,
     };
-  }, [filteredData, timeGrain, groupBy, brandMode, topLimit]);
+  }, [filteredData, timeGrain, groupBy, brandMode, topLimit, isCustomGroupEnabled, customGroups, brandToGroupMap, hideUngrouped]);
 
   // Active series list (excluding user-disabled series)
   const activeSeriesNames = useMemo(() => {
@@ -650,6 +777,336 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
 
   const activeEventConfig = EVENT_TYPE_MAP[targetEventType] || EVENT_TYPES_CONFIG[0];
 
+  // =========================================================================
+  // PPT High-Resolution Combined Image Export & Clipboard Copy
+  // =========================================================================
+  const [isExporting, setIsExporting] = useState<boolean>(false);
+  const [exportToast, setExportToast] = useState<string | null>(null);
+
+  const handleExportPpt = async (action: "copy" | "download") => {
+    if (isExporting || timeKeys.length === 0) return;
+    setIsExporting(true);
+
+    try {
+      const isDual = viewLayout === "dual";
+      const showCount = viewLayout === "dual" || viewLayout === "count_only";
+      const showShare = viewLayout === "dual" || viewLayout === "share_only";
+
+      const exportWidth = 1400;
+      const singleHeight = 310;
+      const dpr = 2; // High-DPI 2x resolution for crisp PPT slides
+
+      const targetEventLabel = EVENT_TYPE_MAP[targetEventType]?.label || targetEventType;
+      const customGroupSuffix = isCustomGroupEnabled && customGroups.length > 0 ? " (커스텀 그룹별)" : "";
+
+      const countTitleText =
+        groupBy === "event_brand_breakdown"
+          ? `${targetEventLabel} 월별 실제 건수 추이${customGroupSuffix}`
+          : groupBy === "event_type"
+          ? "부작용 유형별 월별 실제 건수 추이"
+          : `제품별 월별 실제 발생 건수 추이${customGroupSuffix}`;
+
+      const shareTitleText =
+        groupBy === "event_brand_breakdown"
+          ? `[${targetEventLabel}] 월별 100% 누적 비중${customGroupSuffix}`
+          : groupBy === "event_type"
+          ? "부작용 유형별 100% 누적 비중 추이"
+          : `제품별 월별 100% 누적 비중 추이${customGroupSuffix}`;
+
+      // Clean, compact ECharts option for Actual Counts Chart
+      const pptCountSeries = activeSeriesNames.map((name, idx) => {
+        const color =
+          groupBy === "event_type" && EVENT_TYPE_MAP[name]
+            ? EVENT_TYPE_MAP[name].color
+            : BRAND_COLOR_PALETTE[idx % BRAND_COLOR_PALETTE.length];
+        const displayName = groupBy === "event_type" ? formatEventTypeName(name) : name;
+        const seriesData = timeKeys.map((tKey) => rawCountsMatrix[tKey]?.[name] || 0);
+        const isBar = countChartType === "stacked_bar" || countChartType === "grouped_bar";
+        const isStacked = countChartType === "stacked_bar" || countChartType === "area";
+
+        return {
+          name: displayName,
+          type: isBar ? "bar" : "line",
+          data: seriesData,
+          stack: isStacked ? "count_total" : undefined,
+          smooth: !isBar,
+          symbol: countChartType === "line" ? "circle" : "none",
+          symbolSize: 5,
+          itemStyle: { color },
+          lineStyle: { width: 2 },
+        };
+      });
+
+      const cleanCountOption: echarts.EChartsOption = {
+        animation: false,
+        backgroundColor: "#ffffff",
+        title: {
+          text: countTitleText,
+          left: "center",
+          top: 8,
+          textStyle: {
+            color: "#0f172a",
+            fontSize: 13.5,
+            fontWeight: "bold",
+            fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans KR', sans-serif",
+          },
+        },
+        grid: {
+          left: 45,
+          right: 25,
+          top: 34,
+          bottom: 42,
+          containLabel: true,
+        },
+        legend: {
+          show: true,
+          bottom: 2,
+          left: "center",
+          icon: "rect",
+          itemWidth: 10,
+          itemHeight: 10,
+          itemGap: 14,
+          textStyle: { color: "#334155", fontSize: 10 },
+        },
+        xAxis: {
+          type: "category",
+          data: timeKeys,
+          axisLine: { lineStyle: { color: "#cbd5e1" } },
+          axisLabel: {
+            color: "#475569",
+            fontSize: 9.5,
+            rotate: 45,
+            interval: timeKeys.length > 36 ? 1 : 0,
+          },
+        },
+        yAxis: {
+          type: "value",
+          name: "건수",
+          nameLocation: "end",
+          nameGap: 8,
+          nameTextStyle: { color: "#475569", fontSize: 10, fontWeight: "bold" },
+          axisLabel: {
+            color: "#475569",
+            fontSize: 9.5,
+            formatter: (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(0)}k` : v.toLocaleString()),
+          },
+          splitLine: { lineStyle: { color: "#f1f5f9", type: "dashed" } },
+        },
+        series: pptCountSeries as any,
+      };
+
+      // Clean, compact ECharts option for 100% Share Chart
+      const pptShareSeries = activeSeriesNames.map((name, idx) => {
+        const color =
+          groupBy === "event_type" && EVENT_TYPE_MAP[name]
+            ? EVENT_TYPE_MAP[name].color
+            : BRAND_COLOR_PALETTE[idx % BRAND_COLOR_PALETTE.length];
+        const displayName = groupBy === "event_type" ? formatEventTypeName(name) : name;
+        const seriesData = timeKeys.map((tKey) => {
+          const val = matrix[tKey]?.[name] || 0;
+          const tot = activeTotalByTime[tKey] || 1;
+          return parseFloat(((val / tot) * 100).toFixed(1));
+        });
+
+        return {
+          name: displayName,
+          type: "bar",
+          stack: "share_total",
+          data: seriesData,
+          itemStyle: { color },
+        };
+      });
+
+      const cleanShareOption: echarts.EChartsOption = {
+        animation: false,
+        backgroundColor: "#ffffff",
+        title: {
+          text: shareTitleText,
+          left: "center",
+          top: 8,
+          textStyle: {
+            color: "#0f172a",
+            fontSize: 13.5,
+            fontWeight: "bold",
+            fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans KR', sans-serif",
+          },
+        },
+        grid: {
+          left: 45,
+          right: 25,
+          top: 34,
+          bottom: 42,
+          containLabel: true,
+        },
+        legend: {
+          show: true,
+          bottom: 2,
+          left: "center",
+          icon: "rect",
+          itemWidth: 10,
+          itemHeight: 10,
+          itemGap: 14,
+          textStyle: { color: "#334155", fontSize: 10 },
+        },
+        xAxis: {
+          type: "category",
+          data: timeKeys,
+          axisLine: { lineStyle: { color: "#cbd5e1" } },
+          axisLabel: {
+            color: "#475569",
+            fontSize: 9.5,
+            rotate: 45,
+            interval: timeKeys.length > 36 ? 1 : 0,
+          },
+        },
+        yAxis: {
+          type: "value",
+          name: "비중",
+          nameLocation: "end",
+          nameGap: 8,
+          nameTextStyle: { color: "#475569", fontSize: 10, fontWeight: "bold" },
+          max: 100,
+          min: 0,
+          axisLabel: {
+            color: "#475569",
+            fontSize: 9.5,
+            formatter: "{value}%",
+          },
+          splitLine: { lineStyle: { color: "#f1f5f9", type: "dashed" } },
+        },
+        series: pptShareSeries as any,
+      };
+
+      // Offscreen container for rendering high-DPI charts
+      const container = document.createElement("div");
+      container.style.position = "fixed";
+      container.style.left = "-99999px";
+      container.style.top = "-99999px";
+      container.style.visibility = "hidden";
+      document.body.appendChild(container);
+
+      const renderChartToUrl = (opt: echarts.EChartsOption): Promise<string> => {
+        return new Promise((resolve) => {
+          const div = document.createElement("div");
+          div.style.width = `${exportWidth}px`;
+          div.style.height = `${singleHeight}px`;
+          container.appendChild(div);
+
+          const chart = echarts.init(div, null, {
+            renderer: "canvas",
+            devicePixelRatio: dpr,
+            width: exportWidth,
+            height: singleHeight,
+          });
+
+          chart.setOption(opt);
+          setTimeout(() => {
+            const dataUrl = chart.getDataURL({
+              type: "png",
+              pixelRatio: dpr,
+              backgroundColor: "#ffffff",
+            });
+            chart.dispose();
+            resolve(dataUrl);
+          }, 60);
+        });
+      };
+
+      let urlCount: string | null = null;
+      let urlShare: string | null = null;
+
+      if (showCount) {
+        urlCount = await renderChartToUrl(cleanCountOption);
+      }
+      if (showShare) {
+        urlShare = await renderChartToUrl(cleanShareOption);
+      }
+
+      document.body.removeChild(container);
+
+      // Create merged canvas
+      const totalHeight = isDual ? singleHeight * 2 : singleHeight;
+      const finalCanvas = document.createElement("canvas");
+      finalCanvas.width = exportWidth * dpr;
+      finalCanvas.height = totalHeight * dpr;
+
+      const ctx = finalCanvas.getContext("2d");
+      if (!ctx) throw new Error("Canvas context not available");
+
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, finalCanvas.width, finalCanvas.height);
+
+      const loadImage = (url: string): Promise<HTMLImageElement> => {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = url;
+        });
+      };
+
+      if (isDual && urlCount && urlShare) {
+        // Dual view: Actual Count on Top, 100% Share on Bottom (matching user's reference)
+        const [imgCount, imgShare] = await Promise.all([
+          loadImage(urlCount),
+          loadImage(urlShare),
+        ]);
+        ctx.drawImage(imgCount, 0, 0, exportWidth * dpr, singleHeight * dpr);
+        ctx.drawImage(imgShare, 0, singleHeight * dpr, exportWidth * dpr, singleHeight * dpr);
+      } else if (urlCount) {
+        const imgCount = await loadImage(urlCount);
+        ctx.drawImage(imgCount, 0, 0, exportWidth * dpr, singleHeight * dpr);
+      } else if (urlShare) {
+        const imgShare = await loadImage(urlShare);
+        ctx.drawImage(imgShare, 0, 0, exportWidth * dpr, singleHeight * dpr);
+      }
+
+      finalCanvas.toBlob(async (blob) => {
+        if (!blob) {
+          setIsExporting(false);
+          return;
+        }
+
+        const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+        const fileName = `MAUDE_월별추이_PPT_${dateStr}.png`;
+
+        if (action === "copy") {
+          try {
+            await navigator.clipboard.write([
+              new ClipboardItem({ "image/png": blob }),
+            ]);
+            setExportToast("✓ 클립보드에 복사되었습니다! PPT에서 Ctrl+V 하세요.");
+          } catch (clipErr) {
+            console.warn("Clipboard write failed, downloading file instead:", clipErr);
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = fileName;
+            a.click();
+            URL.revokeObjectURL(url);
+            setExportToast("✓ 클립보드 권한 제한으로 PNG 파일이 다운로드되었습니다.");
+          }
+        } else {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = fileName;
+          a.click();
+          URL.revokeObjectURL(url);
+          setExportToast("✓ 고해상도 PPT 이미지가 다운로드되었습니다.");
+        }
+
+        setTimeout(() => setExportToast(null), 3500);
+        setIsExporting(false);
+      }, "image/png");
+    } catch (err) {
+      console.error("Export error:", err);
+      setExportToast("이미지 생성 중 오류가 발생했습니다.");
+      setTimeout(() => setExportToast(null), 3000);
+      setIsExporting(false);
+    }
+  };
+
   return (
     <div className="space-y-4 animate-fadeIn">
       {/* 1. Control Header Bar */}
@@ -838,6 +1295,43 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
                 <span>화이트 (보고서용)</span>
               </button>
             </div>
+
+            {/* PPT Export / Copy Button Group */}
+            <div className="relative flex items-center bg-slate-950 p-1 rounded-xl border border-indigo-500/40 text-xs shadow-sm">
+              <button
+                type="button"
+                onClick={() => handleExportPpt("copy")}
+                disabled={isExporting}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-bold bg-indigo-600 hover:bg-indigo-500 text-white transition shadow-sm disabled:opacity-50"
+                title="상/하 그래프를 여백 없이 PPT 슬라이드 규격으로 합쳐 클립보드에 복사합니다. PPT에서 바로 Ctrl+V 하실 수 있습니다."
+              >
+                {isExporting ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-white" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5 text-indigo-200" />
+                )}
+                <span>{isExporting ? "캡처 중..." : "📋 PPT용 복사"}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleExportPpt("download")}
+                disabled={isExporting}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition disabled:opacity-50"
+                title="합쳐진 고해상도 PPT 이미지를 PNG 파일로 다운로드합니다."
+              >
+                <Download className="w-3.5 h-3.5 text-slate-400" />
+                <span>PNG</span>
+              </button>
+
+              {/* Toast message floating pill */}
+              {exportToast && (
+                <div className="absolute -bottom-9 right-0 bg-emerald-600 text-white text-[11px] font-semibold px-3 py-1 rounded-lg shadow-xl whitespace-nowrap z-50 animate-fadeIn flex items-center gap-1.5 border border-emerald-400/30">
+                  <Check className="w-3.5 h-3.5 text-white" />
+                  <span>{exportToast}</span>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -938,6 +1432,87 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
             )}
           </div>
         ) : null}
+
+        {/* Row 3: Custom Trend Grouping Toolbar (available when not in event_type mode) */}
+        {groupBy !== "event_type" && (
+          <div className="pt-2.5 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs animate-fadeIn">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-slate-300 font-bold flex items-center gap-1.5 mr-1">
+                <FolderPlus className="w-3.5 h-3.5 text-indigo-400" />
+                커스텀 제품 묶음(그룹):
+              </span>
+
+              {/* Open Group Manager Modal Button */}
+              <button
+                type="button"
+                onClick={() => setIsGroupModalOpen(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 font-semibold transition shadow-sm"
+              >
+                <Settings2 className="w-3.5 h-3.5 text-indigo-400" />
+                <span>제품 묶음(그룹) 관리</span>
+                {customGroups.length > 0 && (
+                  <span className="px-1.5 py-0.2 rounded-full bg-indigo-500 text-white text-[10px] font-mono">
+                    {customGroups.length}개
+                  </span>
+                )}
+              </button>
+
+              {/* Grouping Enable/Disable Switch */}
+              {customGroups.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleCustomGroupEnabled(!isCustomGroupEnabled)}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-bold transition ${
+                      isCustomGroupEnabled
+                        ? "bg-emerald-600 text-white border-emerald-500 shadow-sm"
+                        : "bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200"
+                    }`}
+                  >
+                    {isCustomGroupEnabled ? (
+                      <Check className="w-3.5 h-3.5 text-white" />
+                    ) : (
+                      <Square className="w-3.5 h-3.5 text-slate-500" />
+                    )}
+                    <span>묶음 차트 {isCustomGroupEnabled ? "적용 중" : "적용 (OFF)"}</span>
+                  </button>
+
+                  {isCustomGroupEnabled && (
+                    <button
+                      type="button"
+                      onClick={() => handleToggleHideUngrouped(!hideUngrouped)}
+                      className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-[11px] font-medium transition ${
+                        hideUngrouped
+                          ? "bg-sky-500/20 border-sky-500/40 text-sky-300"
+                          : "bg-slate-950/40 border-slate-800 text-slate-400 hover:text-slate-300"
+                      }`}
+                      title="그룹에 지정되지 않은 기타 제품들을 차트에서 숨기고 지정된 그룹들만 비교합니다."
+                    >
+                      <span>{hideUngrouped ? "✓ 지정 그룹만 표시 (외 제품 숨김)" : "미지정 제품도 포함 표시"}</span>
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* Display active custom groups pill list */}
+            {isCustomGroupEnabled && customGroups.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <span className="text-[11px] text-slate-400">적용 그룹:</span>
+                {customGroups.map((g) => (
+                  <span
+                    key={g.id}
+                    className="px-2 py-0.5 rounded-md bg-slate-950/80 border border-slate-800 text-[11px] text-slate-200 flex items-center gap-1.5 font-mono"
+                  >
+                    <span className="w-2 h-2 rounded-full bg-indigo-400"></span>
+                    <span className="font-semibold">{g.name}</span>
+                    <span className="text-slate-400 text-[10px]">({g.brands.length}개 제품)</span>
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 2. Interactive Series Select / Deselect Chips (Auto 100% Re-calculation) */}
@@ -946,6 +1521,8 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
           <span className="text-slate-400 font-semibold mr-1">
             {groupBy === "event_type"
               ? "표시 부작용 유형 선택:"
+              : isCustomGroupEnabled && customGroups.length > 0
+              ? "표시 그룹 선택:"
               : groupBy === "event_brand_breakdown"
               ? `[${activeEventConfig.nameKr}] 내 표시 제품 선택:`
               : "표시 제품 선택:"}
@@ -1016,17 +1593,19 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
               <h3 className={`text-sm font-bold flex items-center gap-2 ${themeStyles.headerText}`}>
                 <span>
                   {groupBy === "event_brand_breakdown"
-                    ? `[${activeEventConfig.label}] 월별 100% 누적 비중`
+                    ? `[${activeEventConfig.label}] 월별 100% 누적 비중 ${isCustomGroupEnabled && customGroups.length > 0 ? "(커스텀 그룹별)" : ""}`
                     : groupBy === "event_type"
                     ? "부작용 유형별 100% 누적 비중 추이"
-                    : "제품별 월별 100% 누적 비중 추이"}
+                    : `제품별 월별 100% 누적 비중 추이 ${isCustomGroupEnabled && customGroups.length > 0 ? "(커스텀 그룹별)" : ""}`}
                 </span>
                 <span className="text-xs px-2 py-0.5 bg-sky-500/20 text-sky-600 dark:text-sky-300 border border-sky-500/30 rounded-md font-normal">
-                  선택된 {activeSeriesNames.length}개 항목 기준 100% 점유율
+                  선택된 {activeSeriesNames.length}개 {isCustomGroupEnabled && customGroups.length > 0 && groupBy !== "event_type" ? "그룹" : "항목"} 기준 100% 점유율
                 </span>
               </h3>
               <p className={`text-[11px] mt-0.5 ${themeStyles.subText}`}>
-                {groupBy === "event_brand_breakdown"
+                {isCustomGroupEnabled && customGroups.length > 0 && groupBy !== "event_type"
+                  ? "사용자가 직접 정의한 제품 그룹별로 합산하여 100%로 환산한 누적 점유율 변화입니다."
+                  : groupBy === "event_brand_breakdown"
                   ? `${activeEventConfig.nameKr}(${targetEventType}) 발생 건 중 각 브랜드가 차지하는 상대적 비중(%) 변화입니다.`
                   : "선택된 항목들의 합을 100%로 환산한 누적 점유율 변화입니다."}
               </p>
@@ -1124,17 +1703,19 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
               <h3 className={`text-sm font-bold flex items-center gap-2 ${themeStyles.headerText}`}>
                 <span>
                   {groupBy === "event_brand_breakdown"
-                    ? `${activeEventConfig.label} 월별 실제 건수 추이`
+                    ? `${activeEventConfig.label} 월별 실제 건수 추이 ${isCustomGroupEnabled && customGroups.length > 0 ? "(커스텀 그룹별)" : ""}`
                     : groupBy === "event_type"
                     ? "부작용 유형별 월별 실제 건수 추이"
-                    : "제품별 월별 실제 발생 건수 추이"}
+                    : `제품별 월별 실제 발생 건수 추이 ${isCustomGroupEnabled && customGroups.length > 0 ? "(커스텀 그룹별)" : ""}`}
                 </span>
                 <span className="text-xs px-2 py-0.5 bg-emerald-500/20 text-emerald-600 dark:text-emerald-300 border border-emerald-500/30 rounded-md font-normal">
                   실제 보고 수치 (건수)
                 </span>
               </h3>
               <p className={`text-[11px] mt-0.5 ${themeStyles.subText}`}>
-                {groupBy === "event_brand_breakdown"
+                {isCustomGroupEnabled && customGroups.length > 0 && groupBy !== "event_type"
+                  ? `사용자 정의 그룹별로 합산된 실제 MAUDE 보고 수량(총 ${overallTargetTotal.toLocaleString()}건)의 시계열 변화입니다.`
+                  : groupBy === "event_brand_breakdown"
                   ? `해당 기간 ${activeEventConfig.nameKr}로 접수된 실제 보고 수량(총 ${overallTargetTotal.toLocaleString()}건)의 시계열 변화입니다.`
                   : "선택된 기간 동안 접수된 실제 MAUDE 보고 건수의 절대 수량 변화입니다."}
               </p>
@@ -1213,6 +1794,15 @@ export const MonthlyTrendTab: React.FC<MonthlyTrendTabProps> = ({ data, loading 
           </div>
         </div>
       )}
+
+      {/* 5. Custom Trend Group Modal */}
+      <CustomTrendGroupModal
+        isOpen={isGroupModalOpen}
+        onClose={() => setIsGroupModalOpen(false)}
+        availableBrands={availableBrands}
+        groups={customGroups}
+        onSaveGroups={handleSaveCustomGroups}
+      />
     </div>
   );
 };
